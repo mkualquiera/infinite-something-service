@@ -21,7 +21,6 @@ from tqdm import trange
 import json
 import os
 from typing import Optional
-from audiocraft.models import MusicGen
 
 from audiocraft.models import MusicGen
 from shap_e.diffusion.sample import sample_latents
@@ -29,6 +28,7 @@ from shap_e.diffusion.gaussian_diffusion import diffusion_from_config
 from shap_e.models.download import load_model, load_config
 from shap_e.util.notebooks import decode_latent_mesh
 from io import StringIO
+import numpy as np
 
 import transformers
 import dotenv
@@ -826,14 +826,13 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     t = time.perf_counter()
     batch_size = 1
     guidance_scale = 15.0
-    prompt = "a shark"
 
     latents = sample_latents(
         batch_size=batch_size,
         model=shap_e,
         diffusion=shap_e_diffusion,
         guidance_scale=guidance_scale,
-        model_kwargs=dict(texts=[prompt] * batch_size),
+        model_kwargs=dict(texts=[request.text] * batch_size),
         progress=True,
         clip_denoised=True,
         use_fp16=True,
@@ -846,7 +845,9 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
 
     # Example of saving the latents as meshes.
     f = StringIO()
-    decode_latent_mesh(xm, latents[0]).tri_mesh().write_obj(f, include_texture=True)
+    tm = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    tm.verts[..., 1] -= tm.verts[..., 1].min()
+    tm.write_obj(f)
     obj = f.getvalue()
     console.print(f"Generated mesh in", time.perf_counter() - t, "seconds")
     return MeshInferenceResponse(obj=obj)
