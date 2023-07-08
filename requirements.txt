@@ -1,0 +1,15 @@
+openai
+diffusers
+transformers
+fastapi
+uvicorn
+python-dotenv
+rich
+tqdm
+git+https://git@github.com/facebookresearch/audiocraft#egg=audiocraft
+gradio
+uvicorn
+k_diffusion
+accelerate
+git+https://github.com/neverix/shap-e
+bitsandbytes
