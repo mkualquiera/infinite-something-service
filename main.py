@@ -212,10 +212,12 @@ class OpenAILLMInteface(object):
         self.model_name = model_name
 
     def __call__(self, prompt: List[Dict[str, str]]) -> str:
-        return openai.ChatCompletion.create(
-            model=self.model_name,
-            messages=prompt
-        ).choices[0].message.content
+        return (
+            openai.ChatCompletion.create(model=self.model_name, messages=prompt)
+            .choices[0]
+            .message.content
+        )
+
 
 class HfLLMInterface(object):
     def __init__(self, model_name, load_kwargs={}) -> None:
@@ -242,21 +244,30 @@ class HfLLMInterface(object):
                 top_p=0.95,
                 repetition_penalty=1.1,
                 max_new_tokens=64,
-                stopping_criteria=[lambda ids, *_: "\n" in self.tokenizer.decode(ids[0][-1])]
-            )[0, input_ids.shape[1]:]
+                stopping_criteria=[
+                    lambda ids, *_: "\n" in self.tokenizer.decode(ids[0][-1])
+                ],
+            )[0, input_ids.shape[1] :]
             return self.tokenizer.decode(output_ids)
 
-# llms = {
-#     "tiny": OpenAILLMInteface("gpt-3.5-turbo"),
-#     "regular": OpenAILLMInteface("gpt-3.5-turbo"),
-#     "hq": OpenAILLMInteface("gpt-4")
-# }
-llms = {
-    "tiny": HfLLMInterface("gpt2"),
-    "tiny": HfLLMInterface("gpt2"),
-    "hq": HfLLMInterface("gpt2"),
-}
-# print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
+
+if os.environ.get("USE_OAI", "0") == "1":
+    # print red bold
+    console.print("[bold red]Using OpenAI API[/bold red]")
+    llms = {
+        "tiny": OpenAILLMInteface("gpt-3.5-turbo"),
+        "regular": OpenAILLMInteface("gpt-3.5-turbo"),
+        "hq": OpenAILLMInteface("gpt-4"),
+    }
+else:
+    console.print("[bold red]Using HuggingFace API[/bold red]")
+    llms = {
+        "tiny": HfLLMInterface("gpt2"),
+        "tiny": HfLLMInterface("gpt2"),
+        "hq": HfLLMInterface("gpt2"),
+    }
+    print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
+
 
 class WorldObject(BaseModel):
     name: str
@@ -294,55 +305,54 @@ class GenerateworldRequest(BaseModel):
 def gen_world(request: GenerateworldRequest) -> World:
     world_desc = request.world_desc
     try:
-        result = llms["regular"]([{
-                        "role": "system",
-                        "content": "You are WorldModelAI. Your purpose is to model"
-                        " the videogamegame world as accurately as possible. The world is "
-                        "represented as a JSON object that describes an "
-                        "environment or scene. Objects do not have a position."
-                        "There must be a game_state object that holds core variables"
-                        "for the game loop and gameplay. The game_state object must also have"
-                        "concrete variables that track the progress of the game and"
-                        "conditions that the player will have to achieve to win"
-                        " (these start as False) or conditions that will fail"
-                        " the game if they are achieved (also start as False)."
-                        " Do not use coordinates such as x and y, there are no"
-                        " positions."
-                        " The win conditions must match the objects in the world"
-                        " for example, if there is a 'find the treasure' win"
-                        " condition, there must be a treasure object in the world."
-                        " Do not place a player object in the world, as this"
-                        " will be handled by the game engine."
-                        "Here is an example world:"
-                        + json.dumps(
-                            {
-                                "objects": [
-                                    {
-                                        "name": "tree",
-                                        "metadata": {"color": "green"},
+        result = llms["regular"](
+            [
+                {
+                    "role": "system",
+                    "content": "You are WorldModelAI. Your purpose is to model"
+                    " the videogamegame world as accurately as possible. The world is "
+                    "represented as a JSON object that describes an "
+                    "environment or scene. Objects do not have a position."
+                    "There must be a game_state object that holds core variables"
+                    "for the game loop and gameplay. The game_state object must also have"
+                    "concrete variables that track the progress of the game and"
+                    "conditions that the player will have to achieve to win"
+                    " (these start as False) or conditions that will fail"
+                    " the game if they are achieved (also start as False)."
+                    " Do not use coordinates such as x and y, there are no"
+                    " positions."
+                    " The win conditions must match the objects in the world"
+                    " for example, if there is a 'find the treasure' win"
+                    " condition, there must be a treasure object in the world."
+                    " Do not place a player object in the world, as this"
+                    " will be handled by the game engine."
+                    "Here is an example world:"
+                    + json.dumps(
+                        {
+                            "objects": [
+                                {
+                                    "name": "tree",
+                                    "metadata": {"color": "green"},
+                                },
+                                {
+                                    "name": "game_state",
+                                    "metadata": {
+                                        "win_conditions": {"cut_tree": False},
+                                        "fail_conditions": {"died_from_hunger": False},
                                     },
-                                    {
-                                        "name": "game_state",
-                                        "metadata": {
-                                            "win_conditions": {"cut_tree": False},
-                                            "fail_conditions": {
-                                                "died_from_hunger": False
-                                            },
-                                        },
-                                    },
-                                ]
-                            }
-                        )
-                        + "\n The name of each object must be unique. The metadata"
-                        " can be any JSON object. Only output the JSON object.",
-                    },
-                    {
-                        "role": "user",
-                        "content": "Generate the world"
-                        "for the description:" + world_desc,
-                    },
-                ],
-            )
+                                },
+                            ]
+                        }
+                    )
+                    + "\n The name of each object must be unique. The metadata"
+                    " can be any JSON object. Only output the JSON object.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate the world" "for the description:" + world_desc,
+                },
+            ],
+        )
         result = fix_model_output(result)
 
         world_dict = json.loads(result)
@@ -357,37 +367,37 @@ def gen_world(request: GenerateworldRequest) -> World:
 def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
     try:
         world, object = request.world, request.object
-        result = llms["regular"]([
-                    {
-                        "role": "user",
-                        "content": "World context: " + json.dumps(world.dict()),
-                    },
-                    {
-                        "role": "system",
-                        "content": "You are WebGameRendererAI. Your purpose is to render"
-                        " world objects as HTML for a web game. These renders must be"
-                        " simple but charming and must represent the state of the object."
-                        " Note that there are some metadata fields that should not be"
-                        " rendered. "
-                        "For example, you must not show the age of an NPC"
-                        " that the player has not met yet."
-                        "The object must be rendered as an HTML div and can use Tailwind css classes. "
-                        "They can use the style attribute for css and hardcoded svg or such."
-                        "\n Feel free to make your renders detailed, colorful, and artistic."
-                        " Only output the HTML. Do not use images or other external assets."
-                        " You must not use position: absolute, position: fixed"
-                        " css. This is because the game engine will position the objects"
-                        " for you. Do not use width and height if your object contains"
-                        " text because it might bleed. Note that we use a dark theme. "
-                        "Only output the HTML.",
-                    },
-                    {
-                        "role": "user",
-                        "content": "Render this object now: "
-                        + json.dumps(object.dict()),
-                    },
-                ],
-            )
+        result = llms["regular"](
+            [
+                {
+                    "role": "user",
+                    "content": "World context: " + json.dumps(world.dict()),
+                },
+                {
+                    "role": "system",
+                    "content": "You are WebGameRendererAI. Your purpose is to render"
+                    " world objects as HTML for a web game. These renders must be"
+                    " simple but charming and must represent the state of the object."
+                    " Note that there are some metadata fields that should not be"
+                    " rendered. "
+                    "For example, you must not show the age of an NPC"
+                    " that the player has not met yet."
+                    "The object must be rendered as an HTML div and can use Tailwind css classes. "
+                    "They can use the style attribute for css and hardcoded svg or such."
+                    "\n Feel free to make your renders detailed, colorful, and artistic."
+                    " Only output the HTML. Do not use images or other external assets."
+                    " You must not use position: absolute, position: fixed"
+                    " css. This is because the game engine will position the objects"
+                    " for you. Do not use width and height if your object contains"
+                    " text because it might bleed. Note that we use a dark theme. "
+                    "Only output the HTML.",
+                },
+                {
+                    "role": "user",
+                    "content": "Render this object now: " + json.dumps(object.dict()),
+                },
+            ],
+        )
         result = fix_model_output(result, start="<", end=">")
         return RenderObjectResponse(html=result)
     except Exception as e:
@@ -410,39 +420,114 @@ def object_prompt(
     try:
         world, object = request.world, request.object
         console.print(object)
-        result = llms["regular"]([
-                    {
-                        "role": "user",
-                        "content": "World context: " + json.dumps(world.dict()),
-                    },
-                    {
-                        "role": "system",
-                        "content": "You are GameRendererAI. Your purpose is to render"
-                        " world objects as prompts that will be fed to an image generation"
-                        "AI model. The object is represented as a JSON that you will"
-                        " describe artistically"
-                        "These prompts must be short and"
-                        " descriptive and must represent the state of the object."
-                        " Note that there are some metadata fields that should not be"
-                        " rendered. "
-                        " Here are some example prompts: "
-                        " Aggresive shark, trending on Artstation\n"
-                        " Potion stand, videogame asset, 4k texture\n"
-                        " Coral reef, pink, destroyed\n"
-                        " Healing potion, high quality videogame icon\n"
-                        "Only output the prompt.",
-                    },
-                    {
-                        "role": "user",
-                        "content": "Render this object now. Output only the prompt: "
-                        + json.dumps(object.dict()),
-                    },
-                ],
-            )
+        result = llms["regular"](
+            [
+                {
+                    "role": "user",
+                    "content": "World context: " + json.dumps(world.dict()),
+                },
+                {
+                    "role": "system",
+                    "content": "You are GameRendererAI. Your purpose is to render"
+                    " world objects as prompts that will be fed to an image generation"
+                    "AI model. The object is represented as a JSON that you will"
+                    " describe artistically"
+                    "These prompts must be short and"
+                    " descriptive and must represent the state of the object."
+                    " Note that there are some metadata fields that should not be"
+                    " rendered. "
+                    " Here are some example prompts: "
+                    " Aggresive shark, trending on Artstation\n"
+                    " Potion stand, videogame asset, 4k texture\n"
+                    " Coral reef, pink, destroyed\n"
+                    " Healing potion, high quality videogame icon\n"
+                    "Only output the prompt.",
+                },
+                {
+                    "role": "user",
+                    "content": "Render this object now. Output only the prompt: "
+                    + json.dumps(object.dict()),
+                },
+            ],
+        )
         console.print(result)
         return ObjectTexturePromptGenerateResponse(prompt=result)
     except Exception as e:
         return render_object(request)
+
+
+class RoomTextureGenerateRequest(BaseModel):
+    world_desc: str
+
+
+class RoomTextureGenerateResponse(BaseModel):
+    floor_texture: str
+    wall_texture: str
+
+
+@app.post("/gen_room_textures")
+def room_textures(
+    request: RoomTextureGenerateRequest,
+) -> RoomTextureGenerateResponse:
+    try:
+        desc = request.world_desc
+        console.print(desc)
+        result = llms["regular"](
+            [
+                {
+                    "role": "system",
+                    "content": "You are GameRendererAI. Your purpose is to describe"
+                    " game textures as prompts that will be fed to an image generation"
+                    "AI model. In our game, there are multiple thematic rooms,"
+                    " and each room has a floor and walls. You will be given"
+                    " a description of the room and you must output a prompt"
+                    " that describes the wall and floor textures. "
+                    "These prompts must be short and"
+                    " descriptive and must represent expectations that fit the"
+                    " theme of the room. Your descriptions should be similar"
+                    " to how textures are often described in online asset stores."
+                    " You will return ONLY a JSON object with the keys floor_texture"
+                    " and wall_texture. Here are some examples: \n"
+                    "Underwater: \n"
+                    + json.dumps(
+                        {
+                            "floor_texture": "Sandy sea floor, small plants, rocks, 4k texture",
+                            "wall_texture": "Underwater, fish, corals",
+                        }
+                    )
+                    + "\n"
+                    "Forest: \n"
+                    + json.dumps(
+                        {
+                            "floor_texture": "Grass, dirt, leaves, videogame asset",
+                            "wall_texture": "Tress, side view, forest",
+                        }
+                    )
+                    + "\n"
+                    "Candyland: \n"
+                    + json.dumps(
+                        {
+                            "floor_texture": "Chocolate soil, candy crush",
+                            "wall_texture": "Pink dunes, side view",
+                        }
+                    )
+                    + "\n"
+                    "Only output the JSON object as shown and nothing else.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate the prompts for this theme now: "
+                    + json.dumps(desc),
+                },
+            ],
+        )
+        console.print(result)
+        result = fix_model_output(result, start="{", end="}")
+        result = json.loads(result)
+        return RoomTextureGenerateResponse.parse_obj(result)
+    except Exception as e:
+        console.print(e)
+        return room_textures(request)
 
 
 class ObjectInteraction(BaseModel):
@@ -466,35 +551,36 @@ def obtain_object_interactions(
 ) -> ObtainObjectInteractionsResponse:
     try:
         world, object = request.world, request.object
-        result = llms["regular"]([
-                    {
-                        "role": "system",
-                        "content": "You are GameMasterAI. Your purpose is to generate"
-                        " interactions between the player and objects in the world. "
-                        "These interactions"
-                        " must be simple but entertaining and must be accurrate to the"
-                        " expectations of the player. The interactions must be"
-                        " represented as a JSON list where each element is an object"
-                        " with a name, a display_name, and arguments. The name is a unique"
-                        " identifier for the interaction and the display_name is"
-                        " what the player sees. Interactions also have arguments, "
-                        " which are a list of questions that the player must answer to"
-                        " complete the interaction."
-                        "Here is an example interaction:"
-                        '{"name": "eat", "display_name": "Eat", "arguments": '
-                        '["What do you want to eat?"]}',
-                    },
-                    {
-                        "role": "user",
-                        "content": "World context: " + json.dumps(world.dict()),
-                    },
-                    {
-                        "role": "user",
-                        "content": "Return JSON interactions for object: "
-                        + json.dumps(object.dict()),
-                    },
-                ],
-            )
+        result = llms["regular"](
+            [
+                {
+                    "role": "system",
+                    "content": "You are GameMasterAI. Your purpose is to generate"
+                    " interactions between the player and objects in the world. "
+                    "These interactions"
+                    " must be simple but entertaining and must be accurrate to the"
+                    " expectations of the player. The interactions must be"
+                    " represented as a JSON list where each element is an object"
+                    " with a name, a display_name, and arguments. The name is a unique"
+                    " identifier for the interaction and the display_name is"
+                    " what the player sees. Interactions also have arguments, "
+                    " which are a list of questions that the player must answer to"
+                    " complete the interaction."
+                    "Here is an example interaction:"
+                    '{"name": "eat", "display_name": "Eat", "arguments": '
+                    '["What do you want to eat?"]}',
+                },
+                {
+                    "role": "user",
+                    "content": "World context: " + json.dumps(world.dict()),
+                },
+                {
+                    "role": "user",
+                    "content": "Return JSON interactions for object: "
+                    + json.dumps(object.dict()),
+                },
+            ],
+        )
         print(result)
         result = fix_model_output(result, start="[", end="]")
 
@@ -550,79 +636,80 @@ class DoInteractResponse(BaseModel):
 def do_interact(request: DoInteractRequest) -> DoInteractResponse:
     try:
         world, object, interaction = request.world, request.object, request.interaction
-        result = llms["hq"]([
-                    {
-                        "role": "user",
-                        "content": "World context: " + json.dumps(world.dict()),
-                    },
-                    {
-                        "role": "system",
-                        "content": "You are GameEngineAI. Your purpose is to execute"
-                        " interactions between the player and objects in the world. "
-                        "The world, object, and interaction are provided as JSON."
-                        "You must return an object of effects that the interaction"
-                        " had on the world. You can use the game_state object"
-                        " metadata to set global variables that track the game"
-                        " progress. "
-                        "Only output the JSON. You can set metadata values to None"
-                        " to delete them."
-                        "Here is an example result that uses all"
-                        " possible effects: \n"
-                        + json.dumps(
-                            {
-                                "delete_objects": [
-                                    {"name": "stick"},
-                                    {"name": "rock"},
-                                ],
-                                "create_objects": [
-                                    {
-                                        "name": "axe",
-                                        "metadata": {"color": "brown"},
-                                    },
-                                ],
-                                "overwrite_metadata": [
-                                    {
-                                        "name": "player",
-                                        "metadata": {"has_crafted": True},
-                                    },
-                                ],
-                                "display_messages": [
-                                    {"message": "Congrats!"},
-                                ],
-                            }
-                        )
-                        + "\nYou should prioritize creating and deleting objects "
-                        "as this is more fun for the player. You should also challenge"
-                        " the player by having certain interactions fail. For example,"
-                        " if the player tries to eat a rock, you should show a message"
-                        " that says 'You can't eat a rock!'. Some interactions should"
-                        " also fail randomly, to represent a sense of difficulty."
-                        " for example a cauldron might explode even if the player"
-                        " correctly follows the recipe for a potion."
-                        "You must not abuse display_messages by using it to display"
-                        "things that didn't happen. For example, you can't say 'The"
-                        "monster died!' if you don't also use delete_objects to delete"
-                        "the monster. You must add new metadata and new objects"
-                        " as the player discovers new things. For example, if the player"
-                        " asks for the name of an NPC, you should add a new metadata"
-                        " field to the NPC object that stores the name. This is "
-                        "important, as otherwise you won't be able to remember"
-                        " the name of the NPC later. You must also make sure to clean"
-                        " up objects that are no longer needed. For example, if this"
-                        " is a game about fixing cars and a car has already been fixed,"
-                        " you should delete the broken car object.",
-                    },
-                    {
-                        "role": "user",
-                        "content": "Object context: " + json.dumps(object.dict()),
-                    },
-                    {
-                        "role": "user",
-                        "content": "Please return JSON effects for this interaction: "
-                        + json.dumps(interaction.dict()),
-                    },
-                ],
-            )
+        result = llms["hq"](
+            [
+                {
+                    "role": "user",
+                    "content": "World context: " + json.dumps(world.dict()),
+                },
+                {
+                    "role": "system",
+                    "content": "You are GameEngineAI. Your purpose is to execute"
+                    " interactions between the player and objects in the world. "
+                    "The world, object, and interaction are provided as JSON."
+                    "You must return an object of effects that the interaction"
+                    " had on the world. You can use the game_state object"
+                    " metadata to set global variables that track the game"
+                    " progress. "
+                    "Only output the JSON. You can set metadata values to None"
+                    " to delete them."
+                    "Here is an example result that uses all"
+                    " possible effects: \n"
+                    + json.dumps(
+                        {
+                            "delete_objects": [
+                                {"name": "stick"},
+                                {"name": "rock"},
+                            ],
+                            "create_objects": [
+                                {
+                                    "name": "axe",
+                                    "metadata": {"color": "brown"},
+                                },
+                            ],
+                            "overwrite_metadata": [
+                                {
+                                    "name": "player",
+                                    "metadata": {"has_crafted": True},
+                                },
+                            ],
+                            "display_messages": [
+                                {"message": "Congrats!"},
+                            ],
+                        }
+                    )
+                    + "\nYou should prioritize creating and deleting objects "
+                    "as this is more fun for the player. You should also challenge"
+                    " the player by having certain interactions fail. For example,"
+                    " if the player tries to eat a rock, you should show a message"
+                    " that says 'You can't eat a rock!'. Some interactions should"
+                    " also fail randomly, to represent a sense of difficulty."
+                    " for example a cauldron might explode even if the player"
+                    " correctly follows the recipe for a potion."
+                    "You must not abuse display_messages by using it to display"
+                    "things that didn't happen. For example, you can't say 'The"
+                    "monster died!' if you don't also use delete_objects to delete"
+                    "the monster. You must add new metadata and new objects"
+                    " as the player discovers new things. For example, if the player"
+                    " asks for the name of an NPC, you should add a new metadata"
+                    " field to the NPC object that stores the name. This is "
+                    "important, as otherwise you won't be able to remember"
+                    " the name of the NPC later. You must also make sure to clean"
+                    " up objects that are no longer needed. For example, if this"
+                    " is a game about fixing cars and a car has already been fixed,"
+                    " you should delete the broken car object.",
+                },
+                {
+                    "role": "user",
+                    "content": "Object context: " + json.dumps(object.dict()),
+                },
+                {
+                    "role": "user",
+                    "content": "Please return JSON effects for this interaction: "
+                    + json.dumps(interaction.dict()),
+                },
+            ],
+        )
         result = fix_model_output(result)
 
         # Turn the result into a DoInteractResponse object
@@ -640,74 +727,75 @@ class GameTickRequest(BaseModel):
 def do_interact(request: GameTickRequest) -> DoInteractResponse:
     try:
         world = request.world
-        result = llms["hq"]([
-                    {
-                        "role": "user",
-                        "content": "World context: " + json.dumps(world.dict()),
-                    },
-                    {
-                        "role": "system",
-                        "content": "You are GameEngineAI. Your purpose is to compute"
-                        " a game world tick."
-                        "The world is provided as JSON."
-                        "You must return a JSON object of effects that the tick"
-                        " had on the world. You can use the game_state object"
-                        " metadata to update global variables that track the game"
-                        " progress. "
-                        "Only output the JSON. You can set metadata values to None"
-                        " to delete them."
-                        "Here is an example result that uses all"
-                        " possible effects: \n"
-                        + json.dumps(
-                            {
-                                "delete_objects": [
-                                    {"name": "seed"},
-                                ],
-                                "create_objects": [
-                                    {
-                                        "name": "plant",
-                                        "metadata": {"growth": "1"},
-                                    },
-                                ],
-                                "overwrite_metadata": [
-                                    {
-                                        "name": "calendar",
-                                        "metadata": {"month": "february"},
-                                    },
-                                ],
-                                "display_messages": [
-                                    {"message": "Your plant grew!"},
-                                ],
-                            }
-                        )
-                        + "\nDuring the game tick, the world gets updated without"
-                        " any player input. You should update the world to reflect"
-                        " the change of time. For example, you can make plants grow"
-                        ", or make the player hungry, or make enemies attack the"
-                        "player, make loyalties change, etc. You should also"
-                        " challenge the player by having new challenges and enemies"
-                        " appear. For example, you can show a new quest, or a new"
-                        " enemy, or a new friendly NPC. Do not perform any actions"
-                        " that require player input. For example, if there is a"
-                        " tree that the player can cut down, you should not cut"
-                        " down the tree during the game tick. Instead, you should"
-                        " make the tree grow older or something like that."
-                        "You must not abuse display_messages by using it to display"
-                        "things that didn't happen. For example, you can't say 'The"
-                        "monster attacks you!' if you don't also use overwrite_metadata "
-                        "to change the player's health. You also can't say something"
-                        " like 'Helena is on her room' if there is no metadata that"
-                        "backs this up. You must also make sure to clean"
-                        " up objects that are no longer needed. For example, if this"
-                        " is a game about fixing cars and a car has already been fixed,"
-                        " you should delete the broken car object.",
-                    },
-                    {
-                        "role": "user",
-                        "content": "Please return JSON effects for this game tick now:",
-                    },
-                ],
-            )
+        result = llms["hq"](
+            [
+                {
+                    "role": "user",
+                    "content": "World context: " + json.dumps(world.dict()),
+                },
+                {
+                    "role": "system",
+                    "content": "You are GameEngineAI. Your purpose is to compute"
+                    " a game world tick."
+                    "The world is provided as JSON."
+                    "You must return a JSON object of effects that the tick"
+                    " had on the world. You can use the game_state object"
+                    " metadata to update global variables that track the game"
+                    " progress. "
+                    "Only output the JSON. You can set metadata values to None"
+                    " to delete them."
+                    "Here is an example result that uses all"
+                    " possible effects: \n"
+                    + json.dumps(
+                        {
+                            "delete_objects": [
+                                {"name": "seed"},
+                            ],
+                            "create_objects": [
+                                {
+                                    "name": "plant",
+                                    "metadata": {"growth": "1"},
+                                },
+                            ],
+                            "overwrite_metadata": [
+                                {
+                                    "name": "calendar",
+                                    "metadata": {"month": "february"},
+                                },
+                            ],
+                            "display_messages": [
+                                {"message": "Your plant grew!"},
+                            ],
+                        }
+                    )
+                    + "\nDuring the game tick, the world gets updated without"
+                    " any player input. You should update the world to reflect"
+                    " the change of time. For example, you can make plants grow"
+                    ", or make the player hungry, or make enemies attack the"
+                    "player, make loyalties change, etc. You should also"
+                    " challenge the player by having new challenges and enemies"
+                    " appear. For example, you can show a new quest, or a new"
+                    " enemy, or a new friendly NPC. Do not perform any actions"
+                    " that require player input. For example, if there is a"
+                    " tree that the player can cut down, you should not cut"
+                    " down the tree during the game tick. Instead, you should"
+                    " make the tree grow older or something like that."
+                    "You must not abuse display_messages by using it to display"
+                    "things that didn't happen. For example, you can't say 'The"
+                    "monster attacks you!' if you don't also use overwrite_metadata "
+                    "to change the player's health. You also can't say something"
+                    " like 'Helena is on her room' if there is no metadata that"
+                    "backs this up. You must also make sure to clean"
+                    " up objects that are no longer needed. For example, if this"
+                    " is a game about fixing cars and a car has already been fixed,"
+                    " you should delete the broken car object.",
+                },
+                {
+                    "role": "user",
+                    "content": "Please return JSON effects for this game tick now:",
+                },
+            ],
+        )
         result = fix_model_output(result)
 
         # Turn the result into a DoInteractResponse object
@@ -726,9 +814,9 @@ class MeshInferenceResponse(BaseModel):
     obj: str
 
 
-xm = load_model('transmitter', device="cuda")
-shap_e = load_model('text300M', device="cuda")
-shap_e_diffusion = diffusion_from_config(load_config('diffusion'))
+xm = load_model("transmitter", device="cuda")
+shap_e = load_model("text300M", device="cuda")
+shap_e_diffusion = diffusion_from_config(load_config("diffusion"))
 
 
 @app.post("/generate_mesh_shap_e")
@@ -769,10 +857,12 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     tm.verts[..., 2] -= (min_z + max_z) / 2
     # Swap z and y axes
     """
+    # Swap z and y axes
     z = tm.verts[..., 2].copy()
     tm.verts[..., 2] = tm.verts[..., 1]
     tm.verts[..., 1] = z
     tm.verts[..., 1] -= tm.verts[..., 1].min()
+
     tm.write_obj(f)
     obj = f.getvalue()
     console.print(f"Generated mesh in", time.perf_counter() - t, "seconds")
