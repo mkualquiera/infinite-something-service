@@ -846,7 +846,22 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     # Example of saving the latents as meshes.
     f = StringIO()
     tm = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    """
     tm.verts[..., 1] -= tm.verts[..., 1].min()
+    # Center the mesh
+    min_x = tm.verts[..., 0].min()
+    max_x = tm.verts[..., 0].max()
+    min_z = tm.verts[..., 2].min()
+    max_z = tm.verts[..., 2].max()
+    tm.verts[..., 0] -= (min_x + max_x) / 2
+    tm.verts[..., 2] -= (min_z + max_z) / 2
+    # Swap z and y axes
+    """
+    z = tm.verts[..., 2].copy()
+    tm.verts[..., 2] = tm.verts[..., 1]
+    tm.verts[..., 1] = z
+    tm.verts[..., 1] -= tm.verts[..., 1].min()
+
     tm.write_obj(f)
     obj = f.getvalue()
     console.print(f"Generated mesh in", time.perf_counter() - t, "seconds")
