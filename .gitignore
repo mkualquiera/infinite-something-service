@@ -1,3 +1,4 @@
 .env
 inference-venv
 __pycache__
+shap_e_model_cache
