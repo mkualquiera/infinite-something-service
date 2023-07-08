@@ -477,7 +477,7 @@ def room_textures(
                 {
                     "role": "system",
                     "content": "You are GameRendererAI. Your purpose is to describe"
-                    " game textrues as prompts that will be fed to an image generation"
+                    " game textures as prompts that will be fed to an image generation"
                     "AI model. In our game, there are multiple thematic rooms,"
                     " and each room has a floor and walls. You will be given"
                     " a description of the room and you must output a prompt"
