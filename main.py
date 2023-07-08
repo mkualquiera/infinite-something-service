@@ -20,6 +20,7 @@ from tqdm import trange
 import json
 import os
 from typing import Optional
+from audiocraft.models import MusicGen
 
 import dotenv
 import openai
