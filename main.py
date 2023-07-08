@@ -6,11 +6,12 @@ import os
 import tempfile
 import time
 import typing as tp
-from typing import Optional
+from typing import Any, Optional, List, Dict
 
 import torch
 import torchaudio
 from diffusers import EulerDiscreteScheduler, StableDiffusionPipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +22,14 @@ import json
 import os
 from typing import Optional
 
+from audiocraft.models import MusicGen
+from shap_e.diffusion.sample import sample_latents
+from shap_e.diffusion.gaussian_diffusion import diffusion_from_config
+from shap_e.models.download import load_model, load_config
+from shap_e.util.notebooks import decode_latent_mesh
+from io import StringIO
+
+import transformers
 import dotenv
 import openai
 
@@ -34,8 +43,8 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 app = FastAPI()
 console = Console()
 
-# create static route for serving test html
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# # create static route for serving test html
+# app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # == Texture generation ==
@@ -95,9 +104,6 @@ def generate(request: TextureInferenceRequest) -> TextureInferenceResponse:
     app.pipe_lock = False
 
     return TextureInferenceResponse(image=image)
-
-
-# == Texture generation ==
 
 
 # == Music generation ==
@@ -192,6 +198,60 @@ def generate(request: MusicInferenceRequest) -> MusicInferenceResponse:
     return MusicInferenceResponse(audio=audio)
 
 
+# == World model ==
+class OpenAILLMInteface(object):
+    def __init__(self, model_name) -> None:
+        self.model_name = model_name
+
+    def __call__(self, prompt: List[Dict[str, str]]) -> str:
+        return openai.ChatCompletion.create(
+            model=self.model_name,
+            messages=prompt
+        ).choices[0].message.content
+
+class HfLLMInterface(object):
+    def __init__(self, model_name, load_kwargs={}) -> None:
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    def __call__(self, prompt: List[Dict[str, str]]) -> Any:
+        text = []
+        for part in prompt:
+            if part["role"] == "user":
+                text.append(f"User: {part['content']}")
+            elif part["role"] == "assistant":
+                text.append(f"Assistant: {part['assistant']}")
+            elif part["role"] == "system":
+                text.append(part["content"])
+        text.append("Assistant:")
+        text = "\n".join(text)
+        input_ids = self.tokenizer.encode(text, return_tensors="pt")
+        with torch.autocast("cuda"):
+            newline = self.tokenizer.encode("\n")[0]
+            output_ids = self.model.generate(
+                input_ids,
+                top_k=40,
+                top_p=0.95,
+                repetition_penalty=1.1,
+                max_new_tokens=64,
+                stopping_criteria=[lambda ids, *_: "\n" in self.tokenizer.decode(ids[0][-1])]
+            )[0, input_ids.shape[1]:]
+            return self.tokenizer.decode(output_ids)
+
+# llms = {
+#     "tiny": OpenAILLMInteface("gpt-3.5-turbo"),
+#     "regular": OpenAILLMInteface("gpt-3.5-turbo"),
+#     "hq": OpenAILLMInteface("gpt-4")
+# }
+llms = {
+    "tiny": HfLLMInterface("gpt2"),
+    # CPU OOM
+    "regular": HfLLMInterface("TheBloke/vicuna-13B-1.1-HF",
+                              load_kwargs={"load_in_4bit": True}),
+    "hq": HfLLMInterface("gpt2"),
+}
+print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
+
 class WorldObject(BaseModel):
     name: str
     metadata: dict | None
@@ -228,11 +288,7 @@ class GenerateworldRequest(BaseModel):
 def gen_world(request: GenerateworldRequest) -> World:
     world_desc = request.world_desc
     try:
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {
+        result = llms["regular"]([{
                         "role": "system",
                         "content": "You are WorldModelAI. Your purpose is to model"
                         " the videogamegame world as accurately as possible. The world is "
@@ -281,9 +337,6 @@ def gen_world(request: GenerateworldRequest) -> World:
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         result = fix_model_output(result)
 
         world_dict = json.loads(result)
@@ -298,10 +351,7 @@ def gen_world(request: GenerateworldRequest) -> World:
 def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
     try:
         world, object = request.world, request.object
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
+        result = llms["regular"]([
                     {
                         "role": "user",
                         "content": "World context: " + json.dumps(world.dict()),
@@ -332,9 +382,6 @@ def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         result = fix_model_output(result, start="<", end=">")
         return RenderObjectResponse(html=result)
     except Exception as e:
@@ -357,10 +404,7 @@ def object_prompt(
     try:
         world, object = request.world, request.object
         console.print(object)
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
+        result = llms["regular"]([
                     {
                         "role": "user",
                         "content": "World context: " + json.dumps(world.dict()),
@@ -389,9 +433,6 @@ def object_prompt(
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         console.print(result)
         return ObjectTexturePromptGenerateResponse(prompt=result)
     except Exception as e:
@@ -419,10 +460,7 @@ def obtain_object_interactions(
 ) -> ObtainObjectInteractionsResponse:
     try:
         world, object = request.world, request.object
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
+        result = llms["regular"]([
                     {
                         "role": "system",
                         "content": "You are GameMasterAI. Your purpose is to generate"
@@ -451,9 +489,6 @@ def obtain_object_interactions(
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         print(result)
         result = fix_model_output(result, start="[", end="]")
 
@@ -509,10 +544,7 @@ class DoInteractResponse(BaseModel):
 def do_interact(request: DoInteractRequest) -> DoInteractResponse:
     try:
         world, object, interaction = request.world, request.object, request.interaction
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[
+        result = llms["hq"]([
                     {
                         "role": "user",
                         "content": "World context: " + json.dumps(world.dict()),
@@ -585,9 +617,6 @@ def do_interact(request: DoInteractRequest) -> DoInteractResponse:
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         result = fix_model_output(result)
 
         # Turn the result into a DoInteractResponse object
@@ -605,10 +634,7 @@ class GameTickRequest(BaseModel):
 def do_interact(request: GameTickRequest) -> DoInteractResponse:
     try:
         world = request.world
-        result = (
-            openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[
+        result = llms["hq"]([
                     {
                         "role": "user",
                         "content": "World context: " + json.dumps(world.dict()),
@@ -676,9 +702,6 @@ def do_interact(request: GameTickRequest) -> DoInteractResponse:
                     },
                 ],
             )
-            .choices[0]
-            .message.content
-        )
         result = fix_model_output(result)
 
         # Turn the result into a DoInteractResponse object
@@ -686,3 +709,46 @@ def do_interact(request: GameTickRequest) -> DoInteractResponse:
         return DoInteractResponse.parse_obj(effects_dict)
     except Exception as e:
         return do_interact(request)
+
+
+# == 3D generation ==
+class MeshInferenceRequest(BaseModel):
+    text: str
+
+
+class MeshInferenceResponse(BaseModel):
+    obj: str
+
+
+xm = load_model('transmitter', device="cuda")
+shap_e = load_model('text300M', device="cuda")
+shap_e_diffusion = diffusion_from_config(load_config('diffusion'))
+
+
+@app.post("/generate_mesh_shap_e")
+@torch.no_grad()
+def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
+    batch_size = 1
+    guidance_scale = 15.0
+    prompt = "a shark"
+
+    latents = sample_latents(
+        batch_size=batch_size,
+        model=shap_e,
+        diffusion=shap_e_diffusion,
+        guidance_scale=guidance_scale,
+        model_kwargs=dict(texts=[prompt] * batch_size),
+        progress=True,
+        clip_denoised=True,
+        use_fp16=True,
+        use_karras=True,
+        karras_steps=64,
+        sigma_min=1e-3,
+        sigma_max=160,
+        s_churn=0,
+    )
+
+    # Example of saving the latents as meshes.
+    f = StringIO()
+    decode_latent_mesh(xm, latent).tri_mesh().write_obj(f)
+    return MeshInferenceResponse(obj=f.read())
