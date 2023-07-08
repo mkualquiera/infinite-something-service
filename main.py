@@ -55,7 +55,13 @@ def patch_conv(**patch):
     def __init__(self, *args, **kwargs):
         return init(self, *args, **kwargs, **patch)
 
+    cls.__orig_init__ = init
     cls.__init__ = __init__
+
+
+def unpatch_conv():
+    cls = torch.nn.Conv2d
+    cls.__init__ = cls.__orig_init__
 
 
 patch_conv(padding_mode="circular")
@@ -65,6 +71,7 @@ pipe = StableDiffusionPipeline.from_pretrained(
     torch_dtype=torch.float16,
     custom_pipeline="sd_text2img_k_diffusion",
 )
+unpatch_conv()
 pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 pipe = pipe.to("cuda")
 
@@ -245,9 +252,7 @@ class HfLLMInterface(object):
 # }
 llms = {
     "tiny": HfLLMInterface("gpt2"),
-    # CPU OOM
-    "regular": HfLLMInterface("TheBloke/vicuna-13B-1.1-HF",
-                              load_kwargs={"load_in_4bit": True}),
+    "tiny": HfLLMInterface("gpt2"),
     "hq": HfLLMInterface("gpt2"),
 }
 print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
