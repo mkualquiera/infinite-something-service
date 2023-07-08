@@ -21,6 +21,7 @@ from tqdm import trange
 import json
 import os
 from typing import Optional
+from audiocraft.models import MusicGen
 
 from audiocraft.models import MusicGen
 from shap_e.diffusion.sample import sample_latents
