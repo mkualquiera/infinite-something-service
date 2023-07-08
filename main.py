@@ -1,0 +1,688 @@
+import argparse
+import base64
+import io
+import json
+import os
+import tempfile
+import time
+import typing as tp
+from typing import Optional
+
+import torch
+import torchaudio
+from diffusers import EulerDiscreteScheduler, StableDiffusionPipeline
+from fastapi import FastAPI
+from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from rich.console import Console
+from tqdm import trange
+import json
+import os
+from typing import Optional
+
+import dotenv
+import openai
+
+
+# ==  Game inference ==
+
+dotenv.load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+app = FastAPI()
+console = Console()
+
+# create static route for serving test html
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# == Texture generation ==
+def patch_conv(**patch):
+    cls = torch.nn.Conv2d
+    init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        return init(self, *args, **kwargs, **patch)
+
+    cls.__init__ = __init__
+
+
+patch_conv(padding_mode="circular")
+pipe = StableDiffusionPipeline.from_pretrained(
+    "CompVis/stable-diffusion-v1-4",
+    revision="fp16",
+    torch_dtype=torch.float16,
+    custom_pipeline="sd_text2img_k_diffusion",
+)
+pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+pipe = pipe.to("cuda")
+
+
+class TextureInferenceRequest(BaseModel):
+    text: str
+    sampler: str = "sample_dpmpp_2m"
+
+
+class TextureInferenceResponse(BaseModel):
+    image: str
+
+
+app.pipe_lock = False
+
+
+@app.post("/generate_texture")
+@torch.no_grad()
+def generate(request: TextureInferenceRequest) -> TextureInferenceResponse:
+    while app.pipe_lock:
+        time.sleep(0.1)
+    app.pipe_lock = True
+    console.print(request)
+    t = time.perf_counter()
+    pipe.set_sampler(request.sampler)
+    image = pipe(request.text).images[0]
+    console.print(f"Generated image in", time.perf_counter() - t, "seconds")
+
+    # Convert PIL image to bytes
+    bytes = io.BytesIO()
+    image.save(bytes, format="PNG")
+    image = bytes.getvalue()
+
+    # Convert to b64
+    image = base64.b64encode(image)
+    image = image.decode("utf-8")
+    app.pipe_lock = False
+
+    return TextureInferenceResponse(image=image)
+
+
+# == Texture generation ==
+
+
+# == Music generation ==
+music_model = MusicGen.get_pretrained("small", device="cuda")
+
+
+class MusicInferenceRequest(BaseModel):
+    text: str
+    duration: float = 30
+    loops: int = 4
+
+
+class MusicInferenceResponse(BaseModel):
+    audio: str
+
+
+@app.post("/generate_music")
+@torch.no_grad()
+def generate(request: MusicInferenceRequest) -> MusicInferenceResponse:
+    console.print(request)
+    console.print("Sample rate:", music_model.sample_rate)
+    t = time.perf_counter()
+    attributes, prompt_tokens = music_model._prepare_tokens_and_attributes(
+        [request.text], None
+    )
+
+    music_model.generation_params = {
+        "max_gen_len": int(request.duration * music_model.frame_rate),
+        "use_sampling": True,
+        "temp": 1.0,
+        "top_k": 250,
+        "top_p": 0,
+        "cfg_coef": 3.0,
+        "two_step_cfg": 0,
+    }
+    total = []
+    for _ in trange(request.loops):
+        with music_model.autocast:
+            gen_tokens = music_model.lm.generate(
+                prompt_tokens,
+                attributes,
+                callback=None,
+                **music_model.generation_params,
+            )
+            total.append(
+                gen_tokens[
+                    ..., prompt_tokens.shape[-1] if prompt_tokens is not None else 0 :
+                ]
+            )
+            prompt_tokens = gen_tokens[..., -gen_tokens.shape[-1] // 2 :]
+    gen_tokens = torch.cat(total, -1)
+
+    assert gen_tokens.dim() == 3
+    console.print("gen_tokens information")
+    console.print("Shape:", gen_tokens.shape)
+    console.print("Dtype:", gen_tokens.dtype)
+    console.print("Contents:", gen_tokens)
+    with torch.no_grad():
+        gen_audio = music_model.compression_model.decode(gen_tokens, None)
+    console.print("gen_audio information")
+    console.print("Shape:", gen_audio.shape)
+    console.print("Dtype:", gen_audio.dtype)
+    console.print("Contents:", gen_audio)
+    gen_audio = gen_audio.cpu()
+
+    # Save to tempfile
+    # with tempfile.NamedTemporaryFile("rb", suffix=".wav") as f:
+    #    # audio_write(f.name, gen_audio, music_model.frame_rate)
+    #    torchaudio.save(f.name, gen_audio[0], music_model.sample_rate)
+    #    # Read bytes from tempfile
+    #    f.seek(0)
+    #    audio = f.read()
+
+    # convert to signed 8 bit signed int
+    gen_audio = gen_audio * 128
+    gen_audio = gen_audio.to(torch.int8)
+
+    console.print("gen_audio information")
+    console.print("Shape:", gen_audio.shape)
+    console.print("Dtype:", gen_audio.dtype)
+    console.print("Contents:", gen_audio)
+
+    # to bytes
+    audio = gen_audio.numpy().tobytes()
+
+    console.print(f"Generated audio in", time.perf_counter() - t, "seconds")
+
+    # Convert to b64
+    audio = base64.b64encode(audio)
+    audio = audio.decode("utf-8")
+
+    return MusicInferenceResponse(audio=audio)
+
+
+class WorldObject(BaseModel):
+    name: str
+    metadata: dict | None
+
+
+class World(BaseModel):
+    objects: list[WorldObject]
+
+
+class RenderObjectResponse(BaseModel):
+    html: str
+
+
+class RenderObjectRequest(BaseModel):
+    world: World
+    object: WorldObject
+
+
+def fix_model_output(output, start="{", end="}"):
+    # Find the first { and the last }
+    first_bracket = output.find(start)
+    last_bracket = output.rfind(end)
+    result = output[first_bracket : last_bracket + 1]
+    print(result)
+    return result
+
+
+class GenerateworldRequest(BaseModel):
+    world_desc: str
+    cond: World
+
+
+@app.post("/gen_world")
+def gen_world(request: GenerateworldRequest) -> World:
+    world_desc = request.world_desc
+    try:
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are WorldModelAI. Your purpose is to model"
+                        " the videogamegame world as accurately as possible. The world is "
+                        "represented as a JSON object that describes an "
+                        "environment or scene. Objects do not have a position."
+                        "There must be a game_state object that holds core variables"
+                        "for the game loop and gameplay. The game_state object must also have"
+                        "concrete variables that track the progress of the game and"
+                        "conditions that the player will have to achieve to win"
+                        " (these start as False) or conditions that will fail"
+                        " the game if they are achieved (also start as False)."
+                        " Do not use coordinates such as x and y, there are no"
+                        " positions."
+                        " The win conditions must match the objects in the world"
+                        " for example, if there is a 'find the treasure' win"
+                        " condition, there must be a treasure object in the world."
+                        " Do not place a player object in the world, as this"
+                        " will be handled by the game engine."
+                        "Here is an example world:"
+                        + json.dumps(
+                            {
+                                "objects": [
+                                    {
+                                        "name": "tree",
+                                        "metadata": {"color": "green"},
+                                    },
+                                    {
+                                        "name": "game_state",
+                                        "metadata": {
+                                            "win_conditions": {"cut_tree": False},
+                                            "fail_conditions": {
+                                                "died_from_hunger": False
+                                            },
+                                        },
+                                    },
+                                ]
+                            }
+                        )
+                        + "\n The name of each object must be unique. The metadata"
+                        " can be any JSON object. Only output the JSON object.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Generate the world"
+                        "for the description:" + world_desc,
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        result = fix_model_output(result)
+
+        world_dict = json.loads(result)
+        world = World.parse_obj(world_dict)
+
+        return world
+    except Exception as e:
+        return gen_world(world_desc)
+
+
+@app.post("/render_object")
+def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
+    try:
+        world, object = request.world, request.object
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "World context: " + json.dumps(world.dict()),
+                    },
+                    {
+                        "role": "system",
+                        "content": "You are WebGameRendererAI. Your purpose is to render"
+                        " world objects as HTML for a web game. These renders must be"
+                        " simple but charming and must represent the state of the object."
+                        " Note that there are some metadata fields that should not be"
+                        " rendered. "
+                        "For example, you must not show the age of an NPC"
+                        " that the player has not met yet."
+                        "The object must be rendered as an HTML div and can use Tailwind css classes. "
+                        "They can use the style attribute for css and hardcoded svg or such."
+                        "\n Feel free to make your renders detailed, colorful, and artistic."
+                        " Only output the HTML. Do not use images or other external assets."
+                        " You must not use position: absolute, position: fixed"
+                        " css. This is because the game engine will position the objects"
+                        " for you. Do not use width and height if your object contains"
+                        " text because it might bleed. Note that we use a dark theme. "
+                        "Only output the HTML.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Render this object now: "
+                        + json.dumps(object.dict()),
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        result = fix_model_output(result, start="<", end=">")
+        return RenderObjectResponse(html=result)
+    except Exception as e:
+        return render_object(request)
+
+
+class ObjectTexturePromptGenerateRequest(BaseModel):
+    world: World
+    object: WorldObject
+
+
+class ObjectTexturePromptGenerateResponse(BaseModel):
+    prompt: str
+
+
+@app.post("/object_texture_prompt")
+def object_prompt(
+    request: ObjectTexturePromptGenerateRequest,
+) -> ObjectTexturePromptGenerateResponse:
+    try:
+        world, object = request.world, request.object
+        console.print(object)
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "World context: " + json.dumps(world.dict()),
+                    },
+                    {
+                        "role": "system",
+                        "content": "You are GameRendererAI. Your purpose is to render"
+                        " world objects as prompts that will be fed to an image generation"
+                        "AI model. The object is represented as a JSON that you will"
+                        " describe artistically"
+                        "These prompts must be short and"
+                        " descriptive and must represent the state of the object."
+                        " Note that there are some metadata fields that should not be"
+                        " rendered. "
+                        " Here are some example prompts: "
+                        " Aggresive shark, trending on Artstation\n"
+                        " Potion stand, videogame asset, 4k texture\n"
+                        " Coral reef, pink, destroyed\n"
+                        " Healing potion, high quality videogame icon\n"
+                        "Only output the prompt.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Render this object now. Output only the prompt: "
+                        + json.dumps(object.dict()),
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        console.print(result)
+        return ObjectTexturePromptGenerateResponse(prompt=result)
+    except Exception as e:
+        return render_object(request)
+
+
+class ObjectInteraction(BaseModel):
+    name: str
+    display_name: str
+    arguments: list[str] | None
+
+
+class ObtainObjectInteractionsRequest(BaseModel):
+    world: World
+    object: WorldObject
+
+
+class ObtainObjectInteractionsResponse(BaseModel):
+    interactions: list[ObjectInteraction]
+
+
+@app.post("/interact")
+def obtain_object_interactions(
+    request: ObtainObjectInteractionsRequest,
+) -> ObtainObjectInteractionsResponse:
+    try:
+        world, object = request.world, request.object
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are GameMasterAI. Your purpose is to generate"
+                        " interactions between the player and objects in the world. "
+                        "These interactions"
+                        " must be simple but entertaining and must be accurrate to the"
+                        " expectations of the player. The interactions must be"
+                        " represented as a JSON list where each element is an object"
+                        " with a name, a display_name, and arguments. The name is a unique"
+                        " identifier for the interaction and the display_name is"
+                        " what the player sees. Interactions also have arguments, "
+                        " which are a list of questions that the player must answer to"
+                        " complete the interaction."
+                        "Here is an example interaction:"
+                        '{"name": "eat", "display_name": "Eat", "arguments": '
+                        '["What do you want to eat?"]}',
+                    },
+                    {
+                        "role": "user",
+                        "content": "World context: " + json.dumps(world.dict()),
+                    },
+                    {
+                        "role": "user",
+                        "content": "Return JSON interactions for object: "
+                        + json.dumps(object.dict()),
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        print(result)
+        result = fix_model_output(result, start="[", end="]")
+
+        # Turn the result into a ObtainObjectInteractionsResponse object
+        interactions_dict = json.loads(result)
+        if isinstance(interactions_dict, list):
+            interactions_dict = {"interactions": interactions_dict}
+
+        # Add "custom" interaction which is always available and allows the player
+        # to type in a custom command
+        interactions_dict["interactions"].append(
+            {
+                "name": "custom",
+                "display_name": "Custom",
+                "arguments": ["What do you want to do?"],
+            }
+        )
+
+        interactions = ObtainObjectInteractionsResponse.parse_obj(interactions_dict)
+
+        return interactions
+    except Exception as e:
+        return obtain_object_interactions(request)
+
+
+class DoInteractRequest(BaseModel):
+    world: World
+    object: WorldObject
+    interaction: ObjectInteraction
+
+
+class DeleteObject(BaseModel):
+    name: str
+
+
+CreateObject = WorldObject
+
+OverwriteMetadata = WorldObject
+
+
+class DisplayMessage(BaseModel):
+    message: str
+
+
+class DoInteractResponse(BaseModel):
+    delete_objects: list[DeleteObject] | None
+    create_objects: list[CreateObject] | None
+    overwrite_metadata: list[OverwriteMetadata] | None
+    display_messages: list[DisplayMessage] | None
+
+
+@app.post("/do_interaction")
+def do_interact(request: DoInteractRequest) -> DoInteractResponse:
+    try:
+        world, object, interaction = request.world, request.object, request.interaction
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "World context: " + json.dumps(world.dict()),
+                    },
+                    {
+                        "role": "system",
+                        "content": "You are GameEngineAI. Your purpose is to execute"
+                        " interactions between the player and objects in the world. "
+                        "The world, object, and interaction are provided as JSON."
+                        "You must return an object of effects that the interaction"
+                        " had on the world. You can use the game_state object"
+                        " metadata to set global variables that track the game"
+                        " progress. "
+                        "Only output the JSON. You can set metadata values to None"
+                        " to delete them."
+                        "Here is an example result that uses all"
+                        " possible effects: \n"
+                        + json.dumps(
+                            {
+                                "delete_objects": [
+                                    {"name": "stick"},
+                                    {"name": "rock"},
+                                ],
+                                "create_objects": [
+                                    {
+                                        "name": "axe",
+                                        "metadata": {"color": "brown"},
+                                    },
+                                ],
+                                "overwrite_metadata": [
+                                    {
+                                        "name": "player",
+                                        "metadata": {"has_crafted": True},
+                                    },
+                                ],
+                                "display_messages": [
+                                    {"message": "Congrats!"},
+                                ],
+                            }
+                        )
+                        + "\nYou should prioritize creating and deleting objects "
+                        "as this is more fun for the player. You should also challenge"
+                        " the player by having certain interactions fail. For example,"
+                        " if the player tries to eat a rock, you should show a message"
+                        " that says 'You can't eat a rock!'. Some interactions should"
+                        " also fail randomly, to represent a sense of difficulty."
+                        " for example a cauldron might explode even if the player"
+                        " correctly follows the recipe for a potion."
+                        "You must not abuse display_messages by using it to display"
+                        "things that didn't happen. For example, you can't say 'The"
+                        "monster died!' if you don't also use delete_objects to delete"
+                        "the monster. You must add new metadata and new objects"
+                        " as the player discovers new things. For example, if the player"
+                        " asks for the name of an NPC, you should add a new metadata"
+                        " field to the NPC object that stores the name. This is "
+                        "important, as otherwise you won't be able to remember"
+                        " the name of the NPC later. You must also make sure to clean"
+                        " up objects that are no longer needed. For example, if this"
+                        " is a game about fixing cars and a car has already been fixed,"
+                        " you should delete the broken car object.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Object context: " + json.dumps(object.dict()),
+                    },
+                    {
+                        "role": "user",
+                        "content": "Please return JSON effects for this interaction: "
+                        + json.dumps(interaction.dict()),
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        result = fix_model_output(result)
+
+        # Turn the result into a DoInteractResponse object
+        effects_dict = json.loads(result)
+        return DoInteractResponse.parse_obj(effects_dict)
+    except Exception as e:
+        return do_interact(request)
+
+
+class GameTickRequest(BaseModel):
+    world: World
+
+
+@app.post("/game_tick")
+def do_interact(request: GameTickRequest) -> DoInteractResponse:
+    try:
+        world = request.world
+        result = (
+            openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "World context: " + json.dumps(world.dict()),
+                    },
+                    {
+                        "role": "system",
+                        "content": "You are GameEngineAI. Your purpose is to compute"
+                        " a game world tick."
+                        "The world is provided as JSON."
+                        "You must return a JSON object of effects that the tick"
+                        " had on the world. You can use the game_state object"
+                        " metadata to update global variables that track the game"
+                        " progress. "
+                        "Only output the JSON. You can set metadata values to None"
+                        " to delete them."
+                        "Here is an example result that uses all"
+                        " possible effects: \n"
+                        + json.dumps(
+                            {
+                                "delete_objects": [
+                                    {"name": "seed"},
+                                ],
+                                "create_objects": [
+                                    {
+                                        "name": "plant",
+                                        "metadata": {"growth": "1"},
+                                    },
+                                ],
+                                "overwrite_metadata": [
+                                    {
+                                        "name": "calendar",
+                                        "metadata": {"month": "february"},
+                                    },
+                                ],
+                                "display_messages": [
+                                    {"message": "Your plant grew!"},
+                                ],
+                            }
+                        )
+                        + "\nDuring the game tick, the world gets updated without"
+                        " any player input. You should update the world to reflect"
+                        " the change of time. For example, you can make plants grow"
+                        ", or make the player hungry, or make enemies attack the"
+                        "player, make loyalties change, etc. You should also"
+                        " challenge the player by having new challenges and enemies"
+                        " appear. For example, you can show a new quest, or a new"
+                        " enemy, or a new friendly NPC. Do not perform any actions"
+                        " that require player input. For example, if there is a"
+                        " tree that the player can cut down, you should not cut"
+                        " down the tree during the game tick. Instead, you should"
+                        " make the tree grow older or something like that."
+                        "You must not abuse display_messages by using it to display"
+                        "things that didn't happen. For example, you can't say 'The"
+                        "monster attacks you!' if you don't also use overwrite_metadata "
+                        "to change the player's health. You also can't say something"
+                        " like 'Helena is on her room' if there is no metadata that"
+                        "backs this up. You must also make sure to clean"
+                        " up objects that are no longer needed. For example, if this"
+                        " is a game about fixing cars and a car has already been fixed,"
+                        " you should delete the broken car object.",
+                    },
+                    {
+                        "role": "user",
+                        "content": "Please return JSON effects for this game tick now:",
+                    },
+                ],
+            )
+            .choices[0]
+            .message.content
+        )
+        result = fix_model_output(result)
+
+        # Turn the result into a DoInteractResponse object
+        effects_dict = json.loads(result)
+        return DoInteractResponse.parse_obj(effects_dict)
+    except Exception as e:
+        return do_interact(request)

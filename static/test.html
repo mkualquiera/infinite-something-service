@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <h1>Test the FastAPI Service</h1>
+    <label for="text">Text:</label><br>
+    <input type="text" id="text" name="text"><br>
+    <label for="sampler">Sampler:</label><br>
+    <input type="text" id="sampler" name="sampler" value="sample_dpmpp_2m"><br>
+    <button value="Submit" onclick="generate()">Generate</button><br>
+    <img id="result" src="">
+    <script>
+        function generate() {
+            fetch('/generate', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    "text": document.getElementById("text").value,
+                    "sampler": document.getElementById("sampler").value
+                })
+            }).then(res => res.json()).then(data => {
+                // data.image is b64 encoded but without the "data:image/png;base64," prefix    
+                document.getElementById("result").src = "data:image/png;base64," + data.image;
+            });
+        }
+    </script>
+</body>
+
+</html>

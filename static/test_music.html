@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <h1>Test the FasterAPI Service</h1>
+    <label for="text">Text:</label><br>
+    <input type="text" id="text" name="text" value="Cowbell, moo, happy, bass"><br>
+    <button value="Submit" onclick="generate()">Let's Jam</button><br>
+    <audio id="result" controls></audio>
+    <script>
+        function generate() {
+            fetch('/generate_music', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    "text": document.getElementById("text").value,
+                })
+            }).then(res => res.json()).then(data => {
+                document.getElementById("result").src = "data:audio/wav;base64," + data.audio;
+            });
+        }
+    </script>
+</body>
+
+</html>
