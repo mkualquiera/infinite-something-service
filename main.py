@@ -738,14 +738,13 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     t = time.perf_counter()
     batch_size = 1
     guidance_scale = 15.0
-    prompt = "a shark"
 
     latents = sample_latents(
         batch_size=batch_size,
         model=shap_e,
         diffusion=shap_e_diffusion,
         guidance_scale=guidance_scale,
-        model_kwargs=dict(texts=[prompt] * batch_size),
+        model_kwargs=dict(texts=[request.text] * batch_size),
         progress=True,
         clip_denoised=True,
         use_fp16=True,
