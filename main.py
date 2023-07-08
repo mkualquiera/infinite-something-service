@@ -255,7 +255,7 @@ llms = {
     "tiny": HfLLMInterface("gpt2"),
     "hq": HfLLMInterface("gpt2"),
 }
-print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
+# print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
 
 class WorldObject(BaseModel):
     name: str
@@ -733,6 +733,8 @@ shap_e_diffusion = diffusion_from_config(load_config('diffusion'))
 @app.post("/generate_mesh_shap_e")
 @torch.no_grad()
 def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
+    console.print(request)
+    t = time.perf_counter()
     batch_size = 1
     guidance_scale = 15.0
     prompt = "a shark"
@@ -755,5 +757,7 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
 
     # Example of saving the latents as meshes.
     f = StringIO()
-    decode_latent_mesh(xm, latent).tri_mesh().write_obj(f)
-    return MeshInferenceResponse(obj=f.read())
+    decode_latent_mesh(xm, latents[0]).tri_mesh().write_obj(f, include_texture=True)
+    obj = f.getvalue()
+    console.print(f"Generated mesh in", time.perf_counter() - t, "seconds")
+    return MeshInferenceResponse(obj=obj)
