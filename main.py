@@ -72,7 +72,7 @@ def cuda_wrapper(fn):
             console.print_(args[0])
         result = fn(*args, **kwargs)
         t = time.perf_counter()
-        console.print(f"Generated{' ' + kwargs_outer['object_name'] if 'object_name' in kwargs_outer else ''} in",
+        console.print(f"Generated in",
                       time.perf_counter() - t, "seconds")
         return result
     return fn_
@@ -121,14 +121,17 @@ app.pipe_lock = False
 
 @app.post("/generate_texture")
 @torch.no_grad()
-@cuda_wrapper
+# @cuda_wrapper
 def generate(request: TextureInferenceRequest) -> TextureInferenceResponse:
-#     while app.pipe_lock:
-#         time.sleep(0.1)
-#     app.pipe_lock = True
+    while app.pipe_lock:
+        time.sleep(0.1)
+    app.pipe_lock = True
+    t = time.perf_counter()
     pipe.set_sampler(request.sampler)
     with torch.autocast("cuda"):
         image = pipe(request.text).images[0]
+    console.print(f"Generated texture in",
+                    time.perf_counter() - t, "seconds")
     image = pil_to_b64(image)
     return TextureInferenceResponse(image=image)
 
