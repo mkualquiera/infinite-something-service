@@ -30,9 +30,13 @@ from shap_e.util.notebooks import decode_latent_mesh
 from io import StringIO
 import numpy as np
 
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 import transformers
 import dotenv
 import openai
+from more_itertools import chunked
+from scipy.stats import truncnorm
+from PIL import Image
 
 
 # ==  Game inference ==
@@ -44,8 +48,34 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 app = FastAPI()
 console = Console()
 
-# # create static route for serving test html
-# app.mount("/static", StaticFiles(directory="static"), name="static")
+# create static route for serving test html
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def pil_to_b64(image):
+    # Convert PIL image to bytes
+    bytes = io.BytesIO()
+    image.save(bytes, format="PNG")
+    image = bytes.getvalue()
+
+    # Convert to b64
+    image = base64.b64encode(image)
+    image = image.decode("utf-8")
+    app.pipe_lock = False
+    
+    return image
+
+
+def cuda_wrapper(fn):
+    def fn_(*args, **kwargs):
+        if args:
+            console.print_(args[0])
+        result = fn(*args, **kwargs)
+        t = time.perf_counter()
+        console.print(f"Generated in",
+                      time.perf_counter() - t, "seconds")
+        return result
+    return fn_
 
 
 # == Texture generation ==
@@ -91,26 +121,18 @@ app.pipe_lock = False
 
 @app.post("/generate_texture")
 @torch.no_grad()
+# @cuda_wrapper
 def generate(request: TextureInferenceRequest) -> TextureInferenceResponse:
     while app.pipe_lock:
         time.sleep(0.1)
     app.pipe_lock = True
-    console.print(request)
     t = time.perf_counter()
     pipe.set_sampler(request.sampler)
-    image = pipe(request.text).images[0]
-    console.print(f"Generated image in", time.perf_counter() - t, "seconds")
-
-    # Convert PIL image to bytes
-    bytes = io.BytesIO()
-    image.save(bytes, format="PNG")
-    image = bytes.getvalue()
-
-    # Convert to b64
-    image = base64.b64encode(image)
-    image = image.decode("utf-8")
-    app.pipe_lock = False
-
+    with torch.autocast("cuda"):
+        image = pipe(request.text).images[0]
+    console.print(f"Generated texture in",
+                    time.perf_counter() - t, "seconds")
+    image = pil_to_b64(image)
     return TextureInferenceResponse(image=image)
 
 
@@ -224,13 +246,13 @@ class HfLLMInterface(object):
         self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    def __call__(self, prompt: List[Dict[str, str]]) -> Any:
+    def __call__(self, prompt: List[Dict[str, str]], repetition_penalty=1.1) -> Any:
         text = []
         for part in prompt:
             if part["role"] == "user":
                 text.append(f"User: {part['content']}")
             elif part["role"] == "assistant":
-                text.append(f"Assistant: {part['assistant']}")
+                text.append(f"Assistant: {part['content']}")
             elif part["role"] == "system":
                 text.append(part["content"])
         text.append("Assistant:")
@@ -240,6 +262,40 @@ class HfLLMInterface(object):
             newline = self.tokenizer.encode("\n")[0]
             output_ids = self.model.generate(
                 input_ids,
+                do_sample=True,
+                top_k=40,
+                top_p=0.95,
+                repetition_penalty=repetition_penalty,
+                max_new_tokens=64,
+                stopping_criteria=[
+                    lambda ids, *_: any(tok in self.tokenizer.decode(ids[0][-1]) for tok in ("\n", "</s>"))
+                ],
+            )[0, input_ids.shape[1]:-1]
+            return self.tokenizer.decode(output_ids)
+
+
+class QLLMInterface(object):
+    def __init__(self, model_name, load_kwargs={}) -> None:
+        self.model = AutoGPTQForCausalLM.from_quantized(model_name, device="cuda:0", trust_remote_code=True, **load_kwargs)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    def __call__(self, prompt: List[Dict[str, str]]) -> Any:
+        text = []
+        for part in prompt:
+            if part["role"] == "user":
+                text.append(f"User: {part['content']}")
+            elif part["role"] == "assistant":
+                text.append(f"Assistant: {part['content']}")
+            elif part["role"] == "system":
+                text.append(part["content"])
+        text.append("Assistant:")
+        text = "\n".join(text)
+        input_ids = self.tokenizer.encode(text, return_tensors="pt")
+        with torch.autocast("cuda"):
+            newline = self.tokenizer.encode("\n")[0]
+            output_ids = self.model.generate(
+                input_ids=input_ids.to("cuda"),
+                do_sample=True,
                 top_k=40,
                 top_p=0.95,
                 repetition_penalty=1.1,
@@ -247,10 +303,9 @@ class HfLLMInterface(object):
                 stopping_criteria=[
                     lambda ids, *_: "\n" in self.tokenizer.decode(ids[0][-1])
                 ],
-            )[0, input_ids.shape[1] :]
+            )[0, input_ids.shape[1]:-1]
             return self.tokenizer.decode(output_ids)
-
-
+        
 if os.environ.get("USE_OAI", "0") == "1":
     # print red bold
     console.print("[bold red]Using OpenAI API[/bold red]")
@@ -262,11 +317,12 @@ if os.environ.get("USE_OAI", "0") == "1":
 else:
     console.print("[bold red]Using HuggingFace API[/bold red]")
     llms = {
-        "tiny": HfLLMInterface("gpt2"),
-        "tiny": HfLLMInterface("gpt2"),
-        "hq": HfLLMInterface("gpt2"),
+        "tiny": HfLLMInterface("bigscience/bloom-560m"),
+        "regular": QLLMInterface("vicuna-7B-1.1-GPTQ-4bit-128g",
+                              load_kwargs={"model_basename": "vicuna-7B-1.1-GPTQ-4bit-128g.no-act-order",
+                                          "use_safetensors": False}),
+        "hq": None,
     }
-    print(llms["tiny"]([{"role": "user", "content": "Hello world!"}]))
 
 
 class WorldObject(BaseModel):
@@ -296,11 +352,78 @@ def fix_model_output(output, start="{", end="}"):
     return result
 
 
+class Theme(BaseModel):
+    theme: str
+
+@app.get("/gen_theme")
+def gen_theme():
+    theme = llms["tiny"]([
+        {"role": "system", "content": 'A chat between a curious human ("User") '
+         'and an artificial intelligence assistant ("Generator"). The assistant '
+         'generates themes for video games. Themes are single words or phrases like '
+        '"Cave", "Microscopic" or "School".'},
+        {"role": "user", "content": 'Hello, Generator. Generate me some themes like "Dream", "Sky" and "Candy".'},
+    ] + [
+        {"role": "assistant", "content": theme[:1].upper() + theme[1:]}
+        for theme in "underwater jungle space lake cow".split() + ["ancient egypt"] +
+        "wood music trains war flower star butterfly castle witchcraft ocean".split() +
+        "mountain carnival cake book circus halloween".split()
+    ]).strip()
+    return theme
+
+class GenerateColorRequest(BaseModel):
+    theme: str
+    sigma: float
+
+class Color(BaseModel):
+    colors: List[str]
+    lut: str
+
+COLORS = {"indianred":"#CD5C5C","lightcoral":"#F08080","salmon":"#FA8072","darksalmon":"#E9967A","lightsalmon":"#FFA07A","crimson":"#DC143C","red":"#FF0000","darkred":"#8B0000","pink":"#FFC0CB","lightpink":"#FFB6C1","hotpink":"#FF69B4","deeppink":"#FF1493","mediumvioletred":"#C71585","palevioletred":"#DB7093","coral":"#FF7F50","tomato":"#FF6347","orangered":"#FF4500","darkorange":"#FF8C00","orange":"#FFA500","gold":"#FFD700","yellow":"#FFFF00","lightyellow":"#FFFFE0","lemonchiffon":"#FFFACD","lightgoldenrodyellow":"#FAFAD2","papayawhip":"#FFEFD5","moccasin":"#FFE4B5","peachpuff":"#FFDAB9","palegoldenrod":"#EEE8AA","khaki":"#F0E68C","darkkhaki":"#BDB76B","lavender":"#E6E6FA","thistle":"#D8BFD8","plum":"#DDA0DD","violet":"#EE82EE","orchid":"#DA70D6","fuchsia":"#FF00FF","magenta":"#FF00FF","mediumorchid":"#BA55D3","mediumpurple":"#9370DB","rebeccapurple":"#663399","blueviolet":"#8A2BE2","darkviolet":"#9400D3","darkorchid":"#9932CC","darkmagenta":"#8B008B","purple":"#800080","indigo":"#4B0082","slateblue":"#6A5ACD","darkslateblue":"#483D8B","mediumslateblue":"#7B68EE","greenyellow":"#ADFF2F","chartreuse":"#7FFF00","lawngreen":"#7CFC00","lime":"#00FF00","limegreen":"#32CD32","palegreen":"#98FB98","lightgreen":"#90EE90","mediumspringgreen":"#00FA9A","springgreen":"#00FF7F","mediumseagreen":"#3CB371","seagreen":"#2E8B57","forestgreen":"#228B22","green":"#008000","darkgreen":"#006400","yellowgreen":"#9ACD32","olivedrab":"#6B8E23","olive":"#6B8E23","darkolivegreen":"#556B2F","mediumaquamarine":"#66CDAA","darkseagreen":"#8FBC8B","lightseagreen":"#20B2AA","darkcyan":"#008B8B","teal":"#008080","aqua":"#00FFFF","cyan":"#00FFFF","lightcyan":"#E0FFFF","paleturquoise":"#AFEEEE","aquamarine":"#7FFFD4","turquoise":"#40E0D0","mediumturquoise":"#48D1CC","darkturquoise":"#00CED1","cadetblue":"#5F9EA0","steelblue":"#4682B4","lightsteelblue":"#B0C4DE","powderblue":"#B0E0E6","lightblue":"#ADD8E6","skyblue":"#87CEEB","lightskyblue":"#87CEFA","deepskyblue":"#00BFFF","dodgerblue":"#1E90FF","cornflowerblue":"#6495ED","royalblue":"#4169E1","blue":"#0000FF","mediumblue":"#0000CD","darkblue":"#00008B","navy":"#00008B","midnightblue":"#191970","cornsilk":"#FFF8DC","blanchedalmond":"#FFEBCD","bisque":"#FFE4C4","navajowhite":"#FFDEAD","wheat":"#F5DEB3","burlywood":"#DEB887","tan":"#D2B48C","rosybrown":"#BC8F8F","sandybrown":"#F4A460","goldenrod":"#DAA520","darkgoldenrod":"#B8860B","peru":"#CD853F","chocolate":"#D2691E","saddlebrown":"#8B4513","sienna":"#A0522D","brown":"#A52A2A","maroon":"#800000","white":"#FFFFFF","snow":"#FFFAFA","honeydew":"#F0FFF0","mintcream":"#F5FFFA","azure":"#F0FFFF","aliceblue":"#F0F8FF","ghostwhite":"#F8F8FF","whitesmoke":"#F5F5F5","seashell":"#FFF5EE","beige":"#F5F5DC","oldlace":"#FDF5E6","floralwhite":"#FDF5E6","ivory":"#FFFFF0","antiquewhite":"#FAEBD7","linen":"#FAF0E6","lavenderblush":"#FFF0F5","mistyrose":"#FFE4E1","gainsboro":"#DCDCDC","lightgray":"#D3D3D3","silver":"#C0C0C0","darkgray":"#A9A9A9","gray":"#808080","dimgray":"#696969","lightslategray":"#778899","slategray":"#708090","darkslategray":"#2F4F4F","black":"#000000"}
+@app.post("/gen_color")
+# @cuda_wrapper
+def gen_color(request: GenerateColorRequest) -> Color:
+    res, res_high = 17, 17
+    grid = np.stack(np.mgrid[0:res, 0:res, 0:res], -1)[..., ::-1]
+    
+    colors = llms["tiny"]([
+        {"role": "system", "content": 'A chat between a curious human ("User") and an '
+         'artificial intelligence assistant ("Generator"). The assistant generates themes '
+         'for video games. The assistant is able to output 3 colors '
+         'like red, green and blue for each theme.'},
+    ] + [msg for theme, cs in [
+        ("Underwater", ("cyan", "black", "blue")),
+        ("Jungle", ("green", "brown", "black")),
+        ("Space", ("blue", "black", "white")),
+        ("Circus", ("red", "yellow", "white")),
+        ("Book", ("brown", "black", "white")),
+        ("Halloween", ("orange", "green", "purple")),
+    ] for msg in ({"role": "user", "content": request.theme + "?"},
+                         {"role": "assistant", "content": ", ".join(cs)})], repetition_penalty=1.0).split(",")
+    colors = [name.strip().lower() for name in colors]
+    console.print("Colors generated:", colors)
+    hexes = [COLORS[name] for name in colors if name in COLORS]
+    if not hexes:
+        new_lut = grid
+    else:
+        rgbs = [[int("".join(col), 16) / 255 for col in chunked(color[1:], 2)] for color in hexes]
+        rgbs = np.asarray(rgbs)
+        std = request.sigma
+        dists = []
+        for rgb in rgbs:
+            dists.append(truncnorm(-rgb * std, (1 - rgb) * std))
+        samps = np.stack(np.mgrid[0:res_high, 0:res_high, 0:res_high], -1).reshape(-1, 3) / (res_high - 1)
+        cdfs = np.mean([dist.cdf((samps - rgb) * std) for dist, rgb in zip(dists, rgbs)], 0)
+        attn = ((grid.reshape(-1, 3)[:, None, :] / (res - 1) - cdfs[None, :, :]) ** 2).sum(-1).argmin(-1)
+        samps = samps[attn]
+        new_lut = samps.reshape(grid.shape)
+    pic = Image.fromarray(np.concatenate(new_lut * 255, 1).astype("uint8"))
+    return Color(colors=colors, lut=pil_to_b64(pic))
+
 class GenerateworldRequest(BaseModel):
     world_desc: str
     cond: World
-
-
+    
 @app.post("/gen_world")
 def gen_world(request: GenerateworldRequest) -> World:
     world_desc = request.world_desc
@@ -326,8 +449,12 @@ def gen_world(request: GenerateworldRequest) -> World:
                     " condition, there must be a treasure object in the world."
                     " Do not place a player object in the world, as this"
                     " will be handled by the game engine."
-                    "Here is an example world:"
-                    + json.dumps(
+                    + "\n The name of each object must be unique. The metadata"
+                    " can be any JSON object. Only output the JSON object.",
+                },
+                {"role": "user", "content": "Generate the world for this description: Woodchuck game"},
+                {"role": "assistant", "content":
+                    json.dumps(
                         {
                             "objects": [
                                 {
@@ -344,12 +471,33 @@ def gen_world(request: GenerateworldRequest) -> World:
                             ]
                         }
                     )
-                    + "\n The name of each object must be unique. The metadata"
-                    " can be any JSON object. Only output the JSON object.",
+                },
+                {"role": "user", "content": "Generate the world for this description: Cooking"},
+                {"role": "assistant", "content": '{"objects": [{"name": "kitchen", "metadata": {"has_oven": true}}, {"name": "player", "metadata": {"skill_level": 5, "current_recipe": "soup"}}], "game_state": {"recipes": {"soup": {"prep_time": 10, "cook_time": 20}, "chicken_parmesan": {"prep_time": 45, "cook_time": 30}}}}'},
+                {"role": "user", "content": "Generate the world for this description: Jungle"},
+                {"role": "assistant", "content":
+                    json.dumps({
+                        "objects": [
+                          {"name": "tree", "metadata": {"color": "green"}},
+                          {"name": "bush", "metadata": {"color": "green"}},
+                          {"name": "river", "metadata": {"color": "blue"}},
+                          {"name": "rock", "metadata": {"color": "gray"}},
+                          {"name": "game_state", "metadata": {
+                              "win_conditions": {
+                                "find_treasure": false,
+                                "escape_jungle": false
+                              },
+                              "fail_conditions": {
+                                "died_from_hunger": false,
+                                "attacked_by_wild_animal": false
+                              }
+                            }
+                          }
+                        ]})
                 },
                 {
                     "role": "user",
-                    "content": "Generate the world" "for the description:" + world_desc,
+                    "content": "Generate the world for the description:" + world_desc,
                 },
             ],
         )
@@ -857,6 +1005,7 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     tm.verts[..., 2] -= (min_z + max_z) / 2
     # Swap z and y axes
     """
+    # Swap z and y axes
     z = tm.verts[..., 2].copy()
     tm.verts[..., 2] = tm.verts[..., 1]
     tm.verts[..., 1] = z

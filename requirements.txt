@@ -13,3 +13,4 @@ k_diffusion
 accelerate
 git+https://github.com/openai/shap-e
 bitsandbytes
+auto-gptq[triton]
