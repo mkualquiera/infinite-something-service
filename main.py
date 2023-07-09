@@ -360,7 +360,7 @@ def gen_world(request: GenerateworldRequest) -> World:
 
         return world
     except Exception as e:
-        return gen_world(world_desc)
+        return gen_world(request)
 
 
 @app.post("/render_object")
@@ -453,7 +453,7 @@ def object_prompt(
         console.print(result)
         return ObjectTexturePromptGenerateResponse(prompt=result)
     except Exception as e:
-        return render_object(request)
+        return object_prompt(request)
 
 
 class RoomTextureGenerateRequest(BaseModel):
