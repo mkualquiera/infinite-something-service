@@ -7,6 +7,7 @@ import tempfile
 import time
 import typing as tp
 from typing import Any, Optional, List, Dict
+import gc
 
 import torch
 import torchaudio
@@ -15,6 +16,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+
+from anyio.lowlevel import RunVar
+from anyio import CapacityLimiter
+from starlette.status import HTTP_504_GATEWAY_TIMEOUT
+from fastapi.responses import JSONResponse
+import asyncio
+from fastapi import Request
+
 from pydantic import BaseModel
 from rich.console import Console
 from tqdm import trange
@@ -41,16 +50,30 @@ from PIL import Image
 
 
 # ==  Game inference ==
-
-dotenv.load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-
 app = FastAPI()
 console = Console()
 
 # create static route for serving test html
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# Limit to 1 thread
+@app.on_event("startup")
+def startup():
+    RunVar("_default_thread_limiter").set(CapacityLimiter(1))
+
+
+# # Adding a middleware returning a 504 error if the request processing time is above a certain threshold
+# @app.middleware("http")
+# async def timeout_middleware(request: Request, call_next):
+#     try:
+#         start_time = time.time()
+#         return await asyncio.wait_for(call_next(request), timeout=60)
+#     except asyncio.TimeoutError:
+#         process_time = time.time() - start_time
+#         return JSONResponse({'detail': 'Request processing time excedeed limit',
+#                              'processing_time': process_time},
+#                             status_code=HTTP_504_GATEWAY_TIMEOUT)
 
 
 def pil_to_b64(image):
@@ -62,7 +85,6 @@ def pil_to_b64(image):
     # Convert to b64
     image = base64.b64encode(image)
     image = image.decode("utf-8")
-    app.pipe_lock = False
 
     return image
 
@@ -123,21 +145,28 @@ app.pipe_lock = False
 @app.post("/generate_texture")
 @torch.no_grad()
 # @cuda_wrapper
-def generate(request: TextureInferenceRequest) -> TextureInferenceResponse:
-    while app.pipe_lock:
-        time.sleep(0.1)
-    app.pipe_lock = True
-    t = time.perf_counter()
-    pipe.set_sampler(request.sampler)
-    with torch.autocast("cuda"):
-        image = pipe(request.text).images[0]
-    console.print(f"Generated texture in", time.perf_counter() - t, "seconds")
-    image = pil_to_b64(image)
-    return TextureInferenceResponse(image=image)
+def generate_texture(request: TextureInferenceRequest) -> TextureInferenceResponse:
+    try:
+        while app.pipe_lock:
+            time.sleep(0.1)
+        app.pipe_lock = True
+        t = time.perf_counter()
+        pipe.set_sampler(request.sampler)
+        with torch.autocast("cuda"):
+            image = pipe(request.text).images[0]
+        console.print(f"Generated texture in", time.perf_counter() - t, "seconds")
+        image = pil_to_b64(image)
+        gc.collect()
+        torch.cuda.empty_cache()
+        app.pipe_lock = False
+        return TextureInferenceResponse(image=image)
+    except Exception as e:
+        return generate_texture(request)
 
 
 # == Music generation ==
 music_model = MusicGen.get_pretrained("small", device="cuda")
+music_model.lm.half()
 
 
 class MusicInferenceRequest(BaseModel):
@@ -152,88 +181,97 @@ class MusicInferenceResponse(BaseModel):
 
 @app.post("/generate_music")
 @torch.no_grad()
-def generate(request: MusicInferenceRequest) -> MusicInferenceResponse:
-    console.print(request)
-    console.print("Sample rate:", music_model.sample_rate)
-    t = time.perf_counter()
-    attributes, prompt_tokens = music_model._prepare_tokens_and_attributes(
-        [request.text], None
-    )
+def generate_music(request: MusicInferenceRequest) -> MusicInferenceResponse:
+    try:
+        console.print(request)
+        console.print("Sample rate:", music_model.sample_rate)
+        t = time.perf_counter()
+        attributes, prompt_tokens = music_model._prepare_tokens_and_attributes(
+            [request.text], None
+        )
 
-    music_model.generation_params = {
-        "max_gen_len": int(request.duration * music_model.frame_rate),
-        "use_sampling": True,
-        "temp": 1.0,
-        "top_k": 250,
-        "top_p": 0,
-        "cfg_coef": 3.0,
-        "two_step_cfg": 0,
-    }
-    total = []
-    for _ in trange(request.loops):
-        with music_model.autocast:
-            gen_tokens = music_model.lm.generate(
-                prompt_tokens,
-                attributes,
-                callback=None,
-                **music_model.generation_params,
-            )
-            total.append(
-                gen_tokens[
-                    ..., prompt_tokens.shape[-1] if prompt_tokens is not None else 0 :
-                ]
-            )
-            prompt_tokens = gen_tokens[..., -gen_tokens.shape[-1] // 2 :]
-    gen_tokens = torch.cat(total, -1)
+        music_model.generation_params = {
+            "max_gen_len": int(request.duration * music_model.frame_rate),
+            "use_sampling": True,
+            "temp": 1.0,
+            "top_k": 250,
+            "top_p": 0,
+            "cfg_coef": 3.0,
+            "two_step_cfg": 0,
+        }
+        total = []
+        for _ in trange(request.loops):
+            with music_model.autocast:
+                gen_tokens = music_model.lm.generate(
+                    prompt_tokens,
+                    attributes,
+                    callback=None,
+                    **music_model.generation_params,
+                )
+                total.append(
+                    gen_tokens[
+                        ..., prompt_tokens.shape[-1] if prompt_tokens is not None else 0 :
+                    ]
+                )
+                prompt_tokens = gen_tokens[..., -gen_tokens.shape[-1] // 2 :]
+        gen_tokens = torch.cat(total, -1)
 
-    assert gen_tokens.dim() == 3
-    console.print("gen_tokens information")
-    console.print("Shape:", gen_tokens.shape)
-    console.print("Dtype:", gen_tokens.dtype)
-    console.print("Contents:", gen_tokens)
-    with torch.no_grad():
-        gen_audio = music_model.compression_model.decode(gen_tokens, None)
-    console.print("gen_audio information")
-    console.print("Shape:", gen_audio.shape)
-    console.print("Dtype:", gen_audio.dtype)
-    console.print("Contents:", gen_audio)
-    gen_audio = gen_audio.cpu()
+        assert gen_tokens.dim() == 3
+        console.print("gen_tokens information")
+        console.print("Shape:", gen_tokens.shape)
+        console.print("Dtype:", gen_tokens.dtype)
+        console.print("Contents:", gen_tokens)
+        with torch.no_grad():
+            gen_audio = music_model.compression_model.decode(gen_tokens, None)
+        console.print("gen_audio information")
+        console.print("Shape:", gen_audio.shape)
+        console.print("Dtype:", gen_audio.dtype)
+        console.print("Contents:", gen_audio)
+        gen_audio = gen_audio.cpu()
 
-    # Save to tempfile
-    # with tempfile.NamedTemporaryFile("rb", suffix=".wav") as f:
-    #    # audio_write(f.name, gen_audio, music_model.frame_rate)
-    #    torchaudio.save(f.name, gen_audio[0], music_model.sample_rate)
-    #    # Read bytes from tempfile
-    #    f.seek(0)
-    #    audio = f.read()
+        # Save to tempfile
+        # with tempfile.NamedTemporaryFile("rb", suffix=".wav") as f:
+        #    # audio_write(f.name, gen_audio, music_model.frame_rate)
+        #    torchaudio.save(f.name, gen_audio[0], music_model.sample_rate)
+        #    # Read bytes from tempfile
+        #    f.seek(0)
+        #    audio = f.read()
 
-    # convert to signed 8 bit signed int
-    gen_audio = gen_audio * 128
-    gen_audio = gen_audio.to(torch.int8)
+        # convert to signed 8 bit signed int
+        gen_audio = gen_audio * 128
+        gen_audio = gen_audio.to(torch.int8)
 
-    console.print("gen_audio information")
-    console.print("Shape:", gen_audio.shape)
-    console.print("Dtype:", gen_audio.dtype)
-    console.print("Contents:", gen_audio)
+        console.print("gen_audio information")
+        console.print("Shape:", gen_audio.shape)
+        console.print("Dtype:", gen_audio.dtype)
+        console.print("Contents:", gen_audio)
 
-    # to bytes
-    audio = gen_audio.numpy().tobytes()
+        # to bytes
+        audio = gen_audio.numpy().tobytes()
 
-    console.print(f"Generated audio in", time.perf_counter() - t, "seconds")
+        console.print(f"Generated audio in", time.perf_counter() - t, "seconds")
 
-    # Convert to b64
-    audio = base64.b64encode(audio)
-    audio = audio.decode("utf-8")
+        # Convert to b64
+        audio = base64.b64encode(audio)
+        audio = audio.decode("utf-8")
 
-    return MusicInferenceResponse(audio=audio)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return MusicInferenceResponse(audio=audio)
+    except Exception as e:  # I sometimes get nk/nv mismatch errors
+        return generate_music(request)
 
 
 # == World model ==
-class OpenAILLMInteface(object):
+class OpenAILLMInterface(object):
     def __init__(self, model_name) -> None:
         self.model_name = model_name
 
-    def __call__(self, prompt: List[Dict[str, str]]) -> str:
+    def __call__(self, prompt: List[Dict[str, str]],
+                 repetition_penalty=1.0  # well...
+                 ) -> str:
+        dotenv.load_dotenv()
+        openai.api_key = os.environ["OPENAI_API_KEY"]
         return (
             openai.ChatCompletion.create(model=self.model_name, messages=prompt)
             .choices[0]
@@ -243,7 +281,7 @@ class OpenAILLMInteface(object):
 
 class HfLLMInterface(object):
     def __init__(self, model_name, load_kwargs={}) -> None:
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs).half().cuda()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def __call__(self, prompt: List[Dict[str, str]], repetition_penalty=1.1) -> Any:
@@ -258,7 +296,7 @@ class HfLLMInterface(object):
         text.append("Assistant:")
         text = "\n".join(text)
         input_ids = self.tokenizer.encode(text, return_tensors="pt")
-        with torch.autocast("cuda"):
+        with torch.autocast("cuda"), torch.inference_mode():
             newline = self.tokenizer.encode("\n")[0]
             output_ids = self.model.generate(
                 input_ids,
@@ -274,17 +312,22 @@ class HfLLMInterface(object):
                     )
                 ],
             )[0, input_ids.shape[1] : -1]
-            return self.tokenizer.decode(output_ids)
+        gc.collect()
+        torch.cuda.empty_cache()
+        return self.tokenizer.decode(output_ids)
 
 
 class QLLMInterface(object):
     def __init__(self, model_name, load_kwargs={}) -> None:
         self.model = AutoGPTQForCausalLM.from_quantized(
-            model_name, device="cuda:0", trust_remote_code=True, **load_kwargs
+            model_name, device="cuda:0",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True, **load_kwargs
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def __call__(self, prompt: List[Dict[str, str]]) -> Any:
+        model.to("cuda:0")
         text = []
         for part in prompt:
             if part["role"] == "user":
@@ -296,7 +339,7 @@ class QLLMInterface(object):
         text.append("Assistant:")
         text = "\n".join(text)
         input_ids = self.tokenizer.encode(text, return_tensors="pt")
-        with torch.autocast("cuda"):
+        with torch.autocast("cuda"), torch.inference_mode():
             newline = self.tokenizer.encode("\n")[0]
             output_ids = self.model.generate(
                 input_ids=input_ids.to("cuda"),
@@ -309,20 +352,13 @@ class QLLMInterface(object):
                     lambda ids, *_: "\n" in self.tokenizer.decode(ids[0][-1])
                 ],
             )[0, input_ids.shape[1] : -1]
-            return self.tokenizer.decode(output_ids)
+        model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        return self.tokenizer.decode(output_ids)
 
 
-if os.environ.get("USE_OAI", "0") == "1":
-    # print red bold
-    console.print("[bold red]Using OpenAI API[/bold red]")
-    llms = {
-        "tiny": OpenAILLMInteface("gpt-3.5-turbo"),
-        "regular": OpenAILLMInteface("gpt-3.5-turbo"),
-        "hq": OpenAILLMInteface("gpt-4"),
-    }
-else:
-    console.print("[bold red]Using HuggingFace API[/bold red]")
-    llms = {
+make_selfhosted = lambda: {
         "tiny": HfLLMInterface("bigscience/bloom-560m"),
         "regular": QLLMInterface(
             "vicuna-7B-1.1-GPTQ-4bit-128g",
@@ -333,6 +369,39 @@ else:
         ),
         "hq": None,
     }
+if os.environ.get("USE_OAI", "0") == "1":
+    # print red bold
+    console.print("[bold red]Using OpenAI API[/bold red]")
+    llms = {
+        "tiny": OpenAILLMInterface("gpt-3.5-turbo"),
+        "regular": OpenAILLMInterface("gpt-3.5-turbo"),
+        "hq": OpenAILLMInterface("gpt-4"),
+    }
+else:
+    console.print("[bold red]Using HuggingFace API[/bold red]")
+    llms = make_selfhosted()
+
+
+class OAIKeyRequest(BaseModel):
+    key: str
+    use_key: bool
+
+
+@app.post("/oai_key")
+def change_oai_key(request: OAIKeyRequest):
+    global llms
+    openai.api_key = request.key
+    os.environ["OPENAI_API_KEY"] = request.key
+    if request.use_key and isinstance(llms["tiny"], HfLLMInterface):
+        console.print("[bold red]Using OpenAI API[/bold red]")
+        llms = {
+            "tiny": OpenAILLMInterface("gpt-3.5-turbo"),
+            "regular": OpenAILLMInterface("gpt-3.5-turbo"),
+            "hq": OpenAILLMInterface("gpt-4"),
+        }
+    if (not request.use_key) and isinstance(llms["tiny"], OpenAILLMInterface):
+        console.print("[bold red]Using HuggingFace API[/bold red]")
+        llms = make_selfhosted
 
 
 class WorldObject(BaseModel):
@@ -368,29 +437,32 @@ class Theme(BaseModel):
 
 @app.get("/gen_theme")
 def gen_theme():
-    theme = llms["tiny"](
-        [
-            {
-                "role": "system",
-                "content": 'A chat between a curious human ("User") '
-                'and an artificial intelligence assistant ("Generator"). The assistant '
-                "generates themes for video games. Themes are single words or phrases like "
-                '"Cave", "Microscopic" or "School".',
-            },
-            {
-                "role": "user",
-                "content": 'Hello, Generator. Generate me some themes like "Dream", "Sky" and "Candy".',
-            },
-        ]
-        + [
-            {"role": "assistant", "content": theme[:1].upper() + theme[1:]}
-            for theme in "underwater jungle space lake cow".split()
-            + ["ancient egypt"]
-            + "wood music trains war flower star butterfly castle witchcraft ocean".split()
-            + "mountain carnival cake book circus halloween".split()
-        ]
-    ).strip()
-    return theme
+    try:
+        theme = llms["tiny"](
+            [
+                {
+                    "role": "system",
+                    "content": 'A chat between a curious human ("User") '
+                    'and an artificial intelligence assistant ("Generator"). The assistant '
+                    "generates themes for video games. Themes are single words or phrases like "
+                    '"Cave", "Microscopic" or "School".',
+                },
+                {
+                    "role": "user",
+                    "content": 'Hello, Generator. Generate me some themes like "Dream", "Sky" and "Candy".',
+                },
+            ]
+            + [
+                {"role": "assistant", "content": theme[:1].upper() + theme[1:]}
+                for theme in "underwater jungle space lake cow".split()
+                + ["ancient egypt"]
+                + "wood music trains war flower star butterfly castle witchcraft ocean".split()
+                + "mountain carnival cake book circus halloween".split()
+            ]
+        ).strip()
+        return theme
+    except Exception as e:
+        return gen_theme()
 
 
 class GenerateColorRequest(BaseModel):
@@ -399,7 +471,7 @@ class GenerateColorRequest(BaseModel):
 
 
 class Color(BaseModel):
-    colors: List[str]
+    colors: List[List[int]]
     lut: str
 
 
@@ -550,66 +622,71 @@ COLORS = {
 @app.post("/gen_color")
 # @cuda_wrapper
 def gen_color(request: GenerateColorRequest) -> Color:
-    res, res_high = 17, 17
-    grid = np.stack(np.mgrid[0:res, 0:res, 0:res], -1)[..., ::-1]
+    try:
+        res, res_high = 17, 17
+        grid = np.stack(np.mgrid[0:res, 0:res, 0:res], -1)[..., ::-1]
 
-    colors = llms["tiny"](
-        [
-            {
-                "role": "system",
-                "content": 'A chat between a curious human ("User") and an '
-                'artificial intelligence assistant ("Generator"). The assistant generates themes '
-                "for video games. The assistant is able to output 3 colors "
-                "like red, green and blue for each theme.",
-            },
-        ]
-        + [
-            msg
-            for theme, cs in [
-                ("Underwater", ("cyan", "black", "blue")),
-                ("Jungle", ("green", "brown", "black")),
-                ("Space", ("blue", "black", "white")),
-                ("Circus", ("red", "yellow", "white")),
-                ("Book", ("brown", "black", "white")),
-                ("Halloween", ("orange", "green", "purple")),
+        colors = llms["tiny"](
+            [
+                {
+                    "role": "system",
+                    "content": 'A chat between a curious human ("User") and an '
+                    'artificial intelligence assistant ("Generator"). The assistant generates themes '
+                    "for video games. The assistant is able to output 3 colors "
+                    "like red, green and blue for each theme. Output only the list of colors,"
+                    " separated by commas.",
+                },
             ]
-            for msg in (
-                {"role": "user", "content": request.theme + "?"},
-                {"role": "assistant", "content": ", ".join(cs)},
-            )
-        ],
-        repetition_penalty=1.0,
-    ).split(",")
-    colors = [name.strip().lower() for name in colors]
-    console.print("Colors generated:", colors)
-    hexes = [COLORS[name] for name in colors if name in COLORS]
-    if not hexes:
-        new_lut = grid
-    else:
+            + [
+                msg
+                for theme, cs in [
+                    ("Underwater", ("cyan", "black", "blue")),
+                    ("Jungle", ("green", "brown", "black")),
+                    ("Space", ("blue", "black", "white")),
+                    ("Circus", ("red", "yellow", "white")),
+                    ("Book", ("brown", "black", "white")),
+                    ("Halloween", ("orange", "green", "purple")),
+                ]
+                for msg in (
+                    {"role": "user", "content": request.theme + "?"},
+                    {"role": "assistant", "content": ", ".join(cs)},
+                )
+            ],
+            repetition_penalty=1.0,
+        ).split(",")
+        colors = [name.strip().lower() for name in colors]
+        console.print("Colors generated:", colors)
+        hexes = [COLORS[name] for name in colors if name in COLORS]
         rgbs = [
             [int("".join(col), 16) / 255 for col in chunked(color[1:], 2)]
             for color in hexes
         ]
-        rgbs = np.asarray(rgbs)
-        std = request.sigma
-        dists = []
-        for rgb in rgbs:
-            dists.append(truncnorm(-rgb * std, (1 - rgb) * std))
-        samps = np.stack(np.mgrid[0:res_high, 0:res_high, 0:res_high], -1).reshape(
-            -1, 3
-        ) / (res_high - 1)
-        cdfs = np.mean(
-            [dist.cdf((samps - rgb) * std) for dist, rgb in zip(dists, rgbs)], 0
-        )
-        attn = (
-            ((grid.reshape(-1, 3)[:, None, :] / (res - 1) - cdfs[None, :, :]) ** 2)
-            .sum(-1)
-            .argmin(-1)
-        )
-        samps = samps[attn]
-        new_lut = samps.reshape(grid.shape)
-    pic = Image.fromarray(np.concatenate(new_lut * 255, 1).astype("uint8"))
-    return Color(colors=colors, lut=pil_to_b64(pic))
+        rgbs_orig = rgbs
+        if not rgbs:
+            new_lut = grid
+        else:
+            rgbs = np.asarray(rgbs)
+            std = request.sigma
+            dists = []
+            for rgb in rgbs:
+                dists.append(truncnorm(-rgb * std, (1 - rgb) * std))
+            samps = np.stack(np.mgrid[0:res_high, 0:res_high, 0:res_high], -1).reshape(
+                -1, 3
+            ) / (res_high - 1)
+            cdfs = np.mean(
+                [dist.cdf((samps - rgb) * std) for dist, rgb in zip(dists, rgbs)], 0
+            )
+            attn = (
+                ((grid.reshape(-1, 3)[:, None, :] / (res - 1) - cdfs[None, :, :]) ** 2)
+                .sum(-1)
+                .argmin(-1)
+            )
+            samps = samps[attn]
+            new_lut = samps.reshape(grid.shape)
+        pic = Image.fromarray(np.concatenate(new_lut * 255, 1).astype("uint8"))
+        return Color(colors=rgbs_orig, lut=pil_to_b64(pic))
+    except Exception as e:
+        return gen_color(request)
 
 
 class GenerateworldRequest(BaseModel):
@@ -766,6 +843,52 @@ def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
         return RenderObjectResponse(html=result)
     except Exception as e:
         return render_object(request)
+
+
+class MusicPromptGenerateRequest(BaseModel):
+    world: World
+
+class MusicPromptGenerateResponse(BaseModel):
+    prompt: str
+
+
+@app.post("/music_prompt")
+def music_prompt(
+    request: MusicPromptGenerateRequest,
+) -> MusicPromptGenerateResponse:
+    try:
+        world = request.world
+        result = llms["regular"](
+            [
+                {
+                    "role": "system",
+                    "content": "You are GameMusicGenreAI. Your purpose is to explain"
+                    " the music genre of game worlds in a text prompt."
+                    ' The world is described as a single word like "Carnival" or "Shark"'
+                    ". Describe what the world's music theme using a text description. "
+                    "These prompts must be very short and"
+                    " descriptive and represent in terms of music what the environment will sound like. "
+                    "Output only the prompt."
+                }
+            ] + [
+                msg for theme, prompt in zip("Underwater Circus Jungle Space Cow War Butterfly Trains Witchcraft Castle".split(), [
+                    'Slow, reverb, low bass',
+                    'Orchestra, accordion, tubba, happy',
+                    'Drums, tribal, indigenous, dangerous',
+                    'Synth, space, futuristic, electronic, slow, empty',
+                    'Cowbell, moo, happy, bass',
+                    'Throat singing, heavy drums, choir',
+                    'Flute, happy, light, airy',
+                    'Flute, happy, rhythmic, repetitive, drums',
+                    'Medieval, spooky',
+                    'Organ, church, cathedral, strong, slow, powerful',
+                ]) for msg in ({"role": "user", "content": theme}, {"role": "assistant", "content": prompt})
+            ] + [{"role": "user", "content": world}]
+        )
+        console.print("Music theme:", result)
+        return MusicPromptGenerateResponse(prompt=result)
+    except Exception as e:
+        return object_prompt(request)
 
 
 class ObjectTexturePromptGenerateRequest(BaseModel):
@@ -1177,7 +1300,9 @@ class MeshInferenceResponse(BaseModel):
 
 
 xm = load_model("transmitter", device="cuda")
+xm.half()
 shap_e = load_model("text300M", device="cuda")
+shap_e.half()
 shap_e_diffusion = diffusion_from_config(load_config("diffusion"))
 
 
@@ -1207,7 +1332,9 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
 
     # Example of saving the latents as meshes.
     f = StringIO()
-    tm = decode_latent_mesh(xm, latents[0]).tri_mesh()
+    with torch.autocast("cuda"):
+        mesh = decode_latent_mesh(xm, latents[0])
+    tm = mesh.tri_mesh()
     """
     tm.verts[..., 1] -= tm.verts[..., 1].min()
     # Center the mesh
@@ -1228,4 +1355,6 @@ def generate_shap_e(request: MeshInferenceRequest) -> MeshInferenceResponse:
     tm.write_obj(f)
     obj = f.getvalue()
     console.print(f"Generated mesh in", time.perf_counter() - t, "seconds")
+    gc.collect()
+    torch.cuda.empty_cache()
     return MeshInferenceResponse(obj=obj)
