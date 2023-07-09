@@ -23,6 +23,7 @@ from starlette.status import HTTP_504_GATEWAY_TIMEOUT
 from fastapi.responses import JSONResponse
 import asyncio
 from fastapi import Request
+import threading
 
 from pydantic import BaseModel
 from rich.console import Console
@@ -63,17 +64,22 @@ def startup():
     RunVar("_default_thread_limiter").set(CapacityLimiter(1))
 
 
-# # Adding a middleware returning a 504 error if the request processing time is above a certain threshold
-# @app.middleware("http")
-# async def timeout_middleware(request: Request, call_next):
-#     try:
-#         start_time = time.time()
-#         return await asyncio.wait_for(call_next(request), timeout=60)
-#     except asyncio.TimeoutError:
-#         process_time = time.time() - start_time
-#         return JSONResponse({'detail': 'Request processing time excedeed limit',
-#                              'processing_time': process_time},
-#                             status_code=HTTP_504_GATEWAY_TIMEOUT)
+lock = threading.Lock()
+# Adding a middleware returning a 504 error
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    if not lock.locked():
+        lock.acquire()
+        try:
+            response = await call_next(request)
+        except RuntimeError as e:
+            lock.release()
+            return JSONResponse(None,
+                                status_code=HTTP_504_GATEWAY_TIMEOUT)
+        lock.release()
+        return response
+    return JSONResponse(None,
+                        status_code=HTTP_504_GATEWAY_TIMEOUT)
 
 
 def pil_to_b64(image):
@@ -166,7 +172,7 @@ def generate_texture(request: TextureInferenceRequest) -> TextureInferenceRespon
 
 # == Music generation ==
 music_model = MusicGen.get_pretrained("small", device="cuda")
-music_model.lm.half()
+# music_model.lm.half()
 
 
 class MusicInferenceRequest(BaseModel):
@@ -648,10 +654,10 @@ def gen_color(request: GenerateColorRequest) -> Color:
                     ("Halloween", ("orange", "green", "purple")),
                 ]
                 for msg in (
-                    {"role": "user", "content": request.theme + "?"},
+                    {"role": "user", "content": theme + "?"},
                     {"role": "assistant", "content": ", ".join(cs)},
                 )
-            ],
+            ] + [{"role": "user", "content": request.theme + "?"}],
             repetition_penalty=1.0,
         ).split(",")
         colors = [name.strip().lower() for name in colors]
@@ -845,19 +851,15 @@ def render_object(request: RenderObjectRequest) -> RenderObjectResponse:
         return render_object(request)
 
 
-class MusicPromptGenerateRequest(BaseModel):
-    world: World
-
 class MusicPromptGenerateResponse(BaseModel):
     prompt: str
 
 
 @app.post("/music_prompt")
 def music_prompt(
-    request: MusicPromptGenerateRequest,
+    request: Theme,
 ) -> MusicPromptGenerateResponse:
     try:
-        world = request.world
         result = llms["regular"](
             [
                 {
@@ -882,13 +884,13 @@ def music_prompt(
                     'Flute, happy, rhythmic, repetitive, drums',
                     'Medieval, spooky',
                     'Organ, church, cathedral, strong, slow, powerful',
-                ]) for msg in ({"role": "user", "content": theme}, {"role": "assistant", "content": prompt})
+                ]) for msg in ({"role": "user", "content": theme}, {"role": "assistant", "content": request.theme})
             ] + [{"role": "user", "content": world}]
         )
         console.print("Music theme:", result)
         return MusicPromptGenerateResponse(prompt=result)
     except Exception as e:
-        return object_prompt(request)
+        return music_prompt(request)
 
 
 class ObjectTexturePromptGenerateRequest(BaseModel):
